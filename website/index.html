@@ -1,0 +1,287 @@
+<!doctype html>
+<!--
+  geodesy's website: https://geodesy-package.syncster.dev
+  Author: Alexius Academia
+  Date: 2026-10-31
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="author" content="Alexius Academia">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>geodesy · Geodesy for Tessel</title>
+  <meta name="description" content="geodesy is a Tessel library for exact distances, azimuths and areas on the ellipsoid, map projections and datum shifts that match PROJ, EPSG codes, PROJ strings and WKT, degrees as text and MGRS.">
+  <meta name="theme-color" content="#be185d">
+  <link rel="canonical" href="https://geodesy-package.syncster.dev/">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="geodesy">
+  <meta property="og:title" content="geodesy · Geodesy for Tessel">
+  <meta property="og:description" content="Karney's geodesics, projections and datum shifts that match PROJ for every EPSG system, PROJ strings and .prj files, grid factors, degrees as text and MGRS, for Tessel apps.">
+  <meta property="og:url" content="https://geodesy-package.syncster.dev/">
+  <meta property="og:image" content="https://geodesy-package.syncster.dev/assets/share.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="Manila to Los Angeles on a Mercator map: the geodesic and the rhumb line">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="#">
+      <svg viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8" fill="#be185d"/><circle cx="16" cy="16" r="9" fill="none" stroke="#fff" stroke-width="2"/><ellipse cx="16" cy="16" rx="4" ry="9" fill="none" stroke="#fff" stroke-width="1.6"/><path d="M7 16 H25" stroke="#fff" stroke-width="1.6"/><path d="M8.5 11.5 Q16 4 23.5 11.5" stroke="#fff" stroke-width="2.2" fill="none" stroke-linecap="round"/></svg>
+      geodesy <small>for Tessel</small>
+    </a>
+    <nav>
+      <a href="#features">Features</a>
+      <a href="#systems" class="optional">Systems</a>
+      <a href="#reference">Reference</a>
+      <a href="https://github.com/alexiusacademia/geodesy">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+
+<div class="hero">
+  <div class="wrap">
+    <div>
+      <p class="eyebrow">A Tessel library</p>
+      <h1>Geodesy for Tessel apps.</h1>
+      <p class="lede">Exact distances, azimuths and areas on the ellipsoid by Karney's algorithms. Map projections and datum shifts that agree with PROJ to the nanometre for all 5144 EPSG projected systems it has, the Philippine PRS92 and Luzon 1911 zones among them. PROJ strings and .prj files, grid-to-ground factors, degrees as text and MGRS.</p>
+      <div class="install">
+        <code>tessel add geodesy</code>
+        <button class="copy" type="button" data-copy="tessel add geodesy">Copy</button>
+      </div>
+      <div class="buttons">
+        <a class="button primary" href="#features">See what it does</a>
+        <a class="button" href="https://github.com/alexiusacademia/geodesy">Code on GitHub</a>
+      </div>
+      <p class="meta">MIT licence · Tessel 0.10 or later · no dependencies</p>
+    </div>
+    <figure class="shot">
+      <img src="assets/route.png" width="1440" height="720" alt="Manila to Los Angeles on a Web Mercator map: the geodesic (11 759 km) arcs north, the rhumb line (12 363 km) is straight">
+    </figure>
+  </div>
+</div>
+
+<section id="features">
+  <div class="wrap">
+    <h2>What it does</h2>
+    <p class="intro">The pictures are drawn with the <a href="https://chart-package.syncster.dev">chart</a> library by the examples that come with geodesy.</p>
+
+    <div class="features2">
+
+      <article class="fcard">
+        <img src="assets/route.png" width="1440" height="720" loading="lazy" alt="The geodesic and the rhumb line from Manila to Los Angeles on a Mercator map">
+        <div class="body">
+          <h3>Geodesics and rhumb lines</h3>
+          <p>The shortest path between any two points, antipodes included, with its azimuths, points along it and the area under it: Karney's algorithms, good to 15 nm. Rhumb lines hold one compass course.</p>
+<pre class="tsl">let r = geodesy.inverse(14.5995, 120.9842, 10.3157, 123.8854)
+print(r.distance)                    // 569218.2057… m (Manila to Cebu)
+let (s, azimuth) = geodesy.rhumb(14.5995, 120.9842, 34.0522, -118.2437)</pre>
+        </div>
+      </article>
+
+      <article class="fcard">
+        <img src="assets/scale.png" width="1440" height="760" loading="lazy" alt="Grid scale factor at 14.6°N across UTM zones 50 to 52 and PRS92 zones I to V">
+        <div class="body">
+          <h3>Grid to ground</h3>
+          <p>The scale factor and meridian convergence of any projected system at a point, as PROJ's get_factors: for reducing measured distances to the grid. PRS92's 2° zones stay within 0.0001 of true scale.</p>
+<pre class="tsl">let zone3 = geodesy.epsg(3123) ?? geodesy.wgs84Crs()
+let (k, _, convergence) = zone3.gridFactors(121.5, 14.6)</pre>
+        </div>
+      </article>
+
+      <article class="fcard">
+        <div class="body">
+          <h3>EPSG codes, PROJ strings and .prj files</h3>
+          <p>578 geographic and 5144 projected EPSG systems, with the shift to WGS84 that PROJ itself picks. Or read a PROJ string, or the WKT in a shapefile's .prj (GDAL's, Esri's or WKT2): an Esri .prj with no shift finds its datum's by name.</p>
+<pre class="tsl">let c = try geodesy.crs("EPSG:3123")
+let d = try geodesy.fromProj("+proj=utm +zone=51 +datum=WGS84")
+let e = try geodesy.fromWkt(readFile("lots.prj") ?? "")
+let (x, y) = geodesy.transform(500000.0, 1600000.0, from: c, to: d)
+writeFile(path: "out.prj", text: c.wkt())</pre>
+        </div>
+      </article>
+
+      <article class="fcard">
+        <div class="body">
+          <h3>Areas, degrees and MGRS</h3>
+          <p>The area of a lot from GPS corners, positive counterclockwise. Degrees read the ways people write them and written back with rounding that carries. MGRS both ways, polar areas included.</p>
+<pre class="tsl">let (area, perimeter) = geodesy.polygonArea(lats, lons)
+let pos = try geodesy.readLatLon("14°35'58.2\"N 120°59'03.1\"E")
+print(geodesy.formatLatLon(14.5995, 120.9842))   // 14°35'58.20"N 120°59'03.12"E
+print(geodesy.toMGRS(14.5995, 120.9842))         // 51PTS8284814992</pre>
+        </div>
+      </article>
+
+    </div>
+  </div>
+</section>
+
+<section id="ways">
+  <div class="wrap">
+    <h2>In a program</h2>
+    <p class="intro">Latitudes and longitudes in degrees, lengths in metres, and points as (x, y): easting and northing, or longitude and latitude, whatever order EPSG lists the axes in.</p>
+    <div class="examples">
+      <article class="example">
+        <h3>From GPS to a Philippine grid</h3>
+        <p>WGS84 to PRS92 zone 3 through EPSG's datum shift, the grid factors there, and the position as text.</p>
+<pre class="tsl">import geodesy
+
+fn main() {
+    let wgs = geodesy.wgs84Crs()
+    let zone3 = geodesy.epsg(3123) ?? wgs          // PRS92 / Philippines zone 3
+    let (e, n) = geodesy.transform(120.97695, 14.58285, from: wgs, to: zone3)
+    print("{e} {n}")                             // 497369.807 1612820.042
+
+    let (lon, lat) = zone3.toLonLat(e, n)
+    let (k, _, convergence) = zone3.gridFactors(lon, lat)
+    print("k = {k}, convergence {convergence}°") // k = 0.99995009, -0.0061°
+
+    print(geodesy.formatLatLon(14.58285, 120.97695))
+    print(geodesy.toMGRS(14.58285, 120.97695))   // 51PTS8205113157
+}</pre>
+      </article>
+      <article class="example">
+        <h3>A lot from its corners</h3>
+        <p>The area and perimeter of a polygon of geodesics, and the distance and bearing of each side, for a survey report.</p>
+<pre class="tsl">import geodesy
+
+fn main() {
+    let lats: [Float] = [14.58285, 14.58285, 14.58375, 14.58375]
+    let lons: [Float] = [120.97695, 120.97788, 120.97788, 120.97695]
+    let (area, perimeter) = geodesy.polygonArea(lats, lons)
+    print("{area} m², {perimeter} m")            // 9979.24 m², 399.59 m
+    for k in 0..lats.count {
+        let j = (k + 1) % lats.count
+        let r = geodesy.inverse(lats[k], lons[k], lats[j], lons[j])
+        print("{k + 1}–{j + 1}: {r.distance} m at {r.azimuth1}°")
+    }
+}</pre>
+      </article>
+    </div>
+  </div>
+</section>
+
+<section id="systems">
+  <div class="wrap">
+    <h2>Projections and datums</h2>
+    <div class="table"><table>
+      <tr><th>Projection</th><th>EPSG systems</th></tr>
+      <tr><td>Transverse Mercator (Krüger's series, exact to nanometres), UTM, UPS</td><td>Most national and state grids, the PRS92 and Luzon 1911 zones</td></tr>
+      <tr><td>Lambert conformal conic: 1SP, 2SP, variant B</td><td>State planes, Lambert-93, national grids</td></tr>
+      <tr><td>Mercator, Web Mercator</td><td>EPSG:3857 and web maps</td></tr>
+      <tr><td>Albers equal-area, Lambert azimuthal equal-area</td><td>Continental and statistical maps</td></tr>
+      <tr><td>Stereographic: polar, oblique, equatorial; oblique on the Gauss sphere</td><td>Polar maps, the Netherlands, Romania, New Brunswick</td></tr>
+      <tr><td>Cassini–Soldner (and EPSG's hyperbolic variant), equidistant cylindrical</td><td>Old cadastral grids</td></tr>
+    </table></div>
+    <p class="intro" style="margin-top:16px">Datum shifts are 7-parameter Helmert transformations through WGS84, the one PROJ picks for each datum from the EPSG database (418 of 578), with PROJ's own ellipsoids and prime meridians. Not yet: Hotine oblique Mercator, Krovak and the Swiss projection (114 EPSG systems).</p>
+  </div>
+</section>
+
+<section id="tested">
+  <div class="wrap">
+    <h2>Checked against GeographicLib and PROJ</h2>
+    <p class="intro">Python programs ask GeographicLib, PROJ (through pyproj), SciPy and the mgrs package for the answers to thousands of cases, and geodesy has to agree with every one.</p>
+    <div class="stats">
+      <div class="stat"><b>138,677</b><span>checks in the library's tests, all passing</span></div>
+      <div class="stat"><b>5,144</b><span>EPSG projected systems, every one checked forward and back</span></div>
+      <div class="stat"><b>0.1 µm</b><span>the largest difference from PROJ in any projection</span></div>
+      <div class="stat"><b>0.13 s</b><span>for 100,000 transforms with a datum shift</span></div>
+    </div>
+  </div>
+</section>
+
+<section id="reference">
+  <div class="wrap">
+    <h2>Reference</h2>
+
+    <h3>On the ellipsoid</h3>
+    <div class="table"><table>
+      <tr><th>Function</th><th>Gives</th></tr>
+      <tr><td><code>inverse(lat1, lon1, lat2, lon2, on:)</code>, <code>distance(…)</code></td><td>The shortest path: distance, azimuths at each end, arc, reduced length, scales, area to the equator.</td></tr>
+      <tr><td><code>direct(lat, lon, azimuth:, distance:)</code></td><td>The point that far along a geodesic.</td></tr>
+      <tr><td><code>line(lat, lon, azimuth:)</code>, <code>lineBetween(…)</code></td><td>A line: <code>position(distance)</code>, <code>points(n)</code>.</td></tr>
+      <tr><td><code>polygonArea(lats, lons)</code>, <code>trackLength(lats, lons)</code></td><td>Area and perimeter of a polygon; length of a track.</td></tr>
+      <tr><td><code>rhumb(…)</code>, <code>rhumbDirect(…)</code>, <code>rhumbPoints(…)</code></td><td>Rhumb lines.</td></tr>
+      <tr><td><code>wgs84()</code>, <code>ellipsoid(a:, f:)</code>, <code>ellipsoidNamed(name)</code></td><td>Ellipsoids: WGS84, your own, or PROJ's 46.</td></tr>
+    </table></div>
+
+    <h3>Coordinate systems</h3>
+    <div class="table"><table>
+      <tr><th>Function or method</th><th>Gives</th></tr>
+      <tr><td><code>epsg(code)</code>, <code>crs(text)</code>, <code>fromProj(text)</code>, <code>fromWkt(text)</code></td><td>A <code>Crs</code> from an EPSG code, a PROJ string or WKT.</td></tr>
+      <tr><td><code>utm(zone:, south:)</code>, <code>utmFor(lat, lon)</code>, <code>utmZone(lat, lon)</code>, <code>wgs84Crs()</code></td><td>WGS84 systems.</td></tr>
+      <tr><td><code>transform(x, y, from:, to:)</code>, <code>transformAll(…)</code></td><td>Points from one system to another.</td></tr>
+      <tr><td><code>c.toWGS84(x, y)</code>, <code>c.fromWGS84(lon, lat)</code>, <code>c.toLonLat</code>, <code>c.fromLonLat</code></td><td>To and from latitude and longitude.</td></tr>
+      <tr><td><code>c.gridFactors(lon, lat)</code></td><td>Meridian and parallel scale, and convergence.</td></tr>
+      <tr><td><code>c.proj()</code>, <code>c.wkt()</code>, <code>epsgCodes(search:)</code></td><td>Writing systems out, and finding codes by name.</td></tr>
+    </table></div>
+
+    <h3>Text</h3>
+    <div class="table"><table>
+      <tr><th>Function</th><th>Gives</th></tr>
+      <tr><td><code>readAngle(text)</code>, <code>readLatLon(text)</code></td><td>Degrees and positions from text.</td></tr>
+      <tr><td><code>formatAngle(degrees, style:, decimals:, hemispheres:)</code>, <code>formatLatLon(lat, lon, …)</code></td><td>Degrees as text: DMS, DM or decimal.</td></tr>
+      <tr><td><code>toMGRS(lat, lon, precision:)</code>, <code>fromMGRS(text, center:)</code></td><td>MGRS references.</td></tr>
+    </table></div>
+    <p class="intro" style="margin-top:14px">The geodesic algorithms are C. F. F. Karney's (GeographicLib, MIT). The EPSG data are from the EPSG Geodetic Parameter Dataset (© IOGP), as PROJ ships it.</p>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>geodesy · MIT licence · © 2026 <a href="https://syncster.dev" rel="author">Alexius Academia</a> · <a href="mailto:admin@syncster.dev">admin@syncster.dev</a> · <a href="https://syncster.dev">syncster.dev</a></span>
+    <nav>
+      <a href="https://github.com/alexiusacademia/geodesy">GitHub</a>
+      <a href="https://tessel-lang.syncster.dev">Tessel</a>
+      <a href="https://tessel-packages.syncster.dev">Libraries</a>
+      <a href="https://units-package.syncster.dev">units</a>
+      <a href="https://viewport-package.syncster.dev">viewport</a>
+    </nav>
+  </div>
+</footer>
+
+<script>
+// Colours the Tessel code: keywords, strings, numbers and comments.
+(function () {
+  const esc = s => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const keywords = /^(import|fn|var|let|if|else|for|in|while|return|match|try|true|false|nil|app|state|struct)$/;
+  const token = /(\/\/[^\n]*)|("(?:\\.|[^"\\])*")|(\b\d+(?:\.\d+)?(?:e-?\d+)?\b)|([A-Za-z_]\w*)/g;
+  for (const pre of document.querySelectorAll("pre.tsl")) {
+    const text = pre.textContent;
+    let out = "", last = 0, m;
+    token.lastIndex = 0;
+    while ((m = token.exec(text))) {
+      out += esc(text.slice(last, m.index));
+      const t = esc(m[0]);
+      if (m[1]) out += '<span class="c">' + t + "</span>";
+      else if (m[2]) out += '<span class="s">' + t + "</span>";
+      else if (m[3]) out += '<span class="n">' + t + "</span>";
+      else if (keywords.test(m[4])) out += '<span class="k">' + t + "</span>";
+      else out += t;
+      last = token.lastIndex;
+    }
+    pre.innerHTML = out + esc(text.slice(last));
+  }
+  for (const b of document.querySelectorAll("[data-copy]")) {
+    b.addEventListener("click", () => {
+      navigator.clipboard.writeText(b.dataset.copy).then(() => {
+        b.textContent = "Copied";
+        setTimeout(() => { b.textContent = "Copy"; }, 1500);
+      }, () => {});
+    });
+  }
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+# geodesy's website: plain files, nothing to build. Netlify deploys this folder
+# whenever main is pushed to GitHub.
+# Author: Alexius Academia
+# Date: 2026-10-31
+[build]
+  publish = "."
+  command = ""
+
+[[headers]]
+  for = "/*.html"
+  [headers.values]
+    Cache-Control = "public, max-age=0, must-revalidate"
