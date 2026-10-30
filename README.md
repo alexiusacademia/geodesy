@@ -6,8 +6,8 @@ projections, datum shifts, and coordinate systems by EPSG code, PROJ string
 or WKT, with degrees as text and MGRS. Geodesics are Karney's algorithms, as
 in GeographicLib, good to about 15 nanometres anywhere on the Earth.
 Projections and datum shifts follow PROJ, the engine of QGIS and GDAL, and
-agree with it to the nanometre for every one of the 5144 EPSG projected
-systems geodesy has.
+agree with it to the nanometre for every one of the 5230 EPSG projected
+systems geodesy has: all of EPSG's but one 3D system.
 
 ```tessel
 import geodesy
@@ -77,7 +77,7 @@ the datum's shift to WGS84.
 
 | Function | Gives |
 |---|---|
-| `epsg(code)` | One of 578 geographic and 5144 projected EPSG systems, or nil: UTM, the Philippine zones of PRS92 (3121–3125) and Luzon 1911 (25391–25395), Web Mercator, US state planes, national grids… |
+| `epsg(code)` | One of 578 geographic and 5230 projected EPSG systems, or nil: UTM, the Philippine zones of PRS92 (3121–3125) and Luzon 1911 (25391–25395), Web Mercator, US state planes, national grids… |
 | `crs(text)` | From "EPSG:3123", a PROJ string, or WKT. |
 | `fromProj(text)` | From a PROJ string, like `+proj=tmerc +lat_0=0 +lon_0=121 +k=0.99995 +x_0=500000 +ellps=clrk66 +towgs84=…`. |
 | `fromWkt(text)` | From WKT1 (a shapefile's `.prj`, as GDAL or Esri write it) or WKT2. |
@@ -97,9 +97,17 @@ Projections: Transverse Mercator (by Krüger's series to 6th order, exact
 to nanometres), UTM, UPS, Mercator, Web Mercator, Lambert conformal conic
 (1SP, 2SP, variant B), Albers equal-area, polar, oblique and equatorial
 stereographic, oblique stereographic on the Gauss sphere (EPSG's), Lambert
-azimuthal equal-area, equidistant cylindrical, and Cassini–Soldner (with
-EPSG's hyperbolic variant). Not yet: Hotine oblique Mercator, Krovak and
-the Swiss oblique Mercator, which leave out 114 EPSG systems.
+azimuthal equal-area, equidistant cylindrical, Cassini–Soldner (with
+EPSG's hyperbolic variant), Hotine oblique Mercator (EPSG's variants A and
+B, by two points, Malaysia's and Borneo's RSO, Michigan), Krovak (Czech and
+Slovak, either orientation), the Swiss oblique Mercator, American
+polyconic (Brazil), azimuthal equidistant (and Guam's), Lambert
+cylindrical equal-area (EASE-Grid), Equal Earth, Laborde (Madagascar),
+Colombia urban, and the New Zealand Map Grid.
+
+A PROJ string's `+axis` gives directions only: x is the east or west value
+and y the north or south one, so Krovak's `+axis=swu` is x west and y
+south, as `wsu`.
 
 Datum shifts are 7-parameter Helmert transformations through WGS84, as
 PROJ does them: the one PROJ itself picks from the EPSG database for each
@@ -126,7 +134,7 @@ Luzon 1911's is the one for the Philippines outside Mindanao.
 Points that can't be (a latitude past 90°, NaN) stop the program with a
 message, like `geodesy: inverse: a latitude must be from -90 to 90…`.
 Reading text returns a `Result` that says what's wrong: `"frob" isn't an
-ellipsoid PROJ knows`, `geodesy doesn't have the projection "omerc"`,
+ellipsoid PROJ knows`, `geodesy doesn't have the projection "robin"`,
 `"51PZZ" isn't a 100 km square of zone 51`, `minutes and seconds must be
 below 60`.
 
@@ -141,7 +149,7 @@ PRS92 zone 3) take 0.13 s, and 100 000 geodesic distances 0.28 s.
 tessel run tests
 ```
 
-checks 138 677 values: the cases in `tests/cases.json` and more by hand.
+checks 142 230 values: the cases in `tests/cases.json` and more by hand.
 
 - 2400 geodesics on WGS84, Clarke 1866, a sphere, and very flat and
   prolate ellipsoids (nearly antipodal points, poles, the equator,
@@ -149,12 +157,16 @@ checks 138 677 values: the cases in `tests/cases.json` and more by hand.
   continents, across 180°, round the poles) and their tracks, against
   GeographicLib.
 - 300 rhumb lines, against SciPy's quadrature.
-- Every one of the 5144 EPSG projected systems at random points in its area,
-  forward and back; 287 datums' shifts to WGS84, both by their Helmert and
+- Every one of the 5230 EPSG projected systems at random points in its area,
+  forward and back (Laborde's and Colombia urban's inverses are formulas
+  that miss by up to a millimetre, as PROJ's do; geodesy matches PROJ's); 287 datums' shifts to WGS84, both by their Helmert and
   by PROJ's own EPSG transformation; 297 transforms between systems on
   different datums; and 600 systems read from PROJ strings and WKT (GDAL,
-  Esri and WKT2, with and without EPSG codes), written back and read again.
-  All against PROJ 9.3 through pyproj.
+  Esri and WKT2, with and without EPSG codes; one system of each method
+  always among them), written back and read again; and PROJ strings for
+  what no EPSG system uses (polar and spherical azimuthal equidistant,
+  Hotine by two points or without rotation, Krovak's `+czech`…). All
+  against PROJ 9.3 through pyproj.
 - 1500 MGRS references against the mgrs package.
 
 `.venv/bin/python tools/gen/gen.py` makes `tables.tsl` from PROJ's database,

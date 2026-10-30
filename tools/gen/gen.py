@@ -29,7 +29,8 @@ from pyproj.enums import PJType  # noqa: E402
 from pyproj.transformer import TransformerGroup  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-METHODS = {"tmerc", "utm", "merc", "lcc", "aea", "stere", "sterea", "laea", "eqc", "cass", "ups"}
+METHODS = {"tmerc", "utm", "merc", "lcc", "aea", "stere", "sterea", "laea", "eqc", "cass", "ups", "omerc", "somerc",
+           "krovak", "col_urban", "poly", "aeqd", "cea", "eqearth", "labrd", "nzmg"}
 WGS84 = CRS.from_epsg(4326)
 
 
@@ -248,7 +249,10 @@ def projected_rows(geo_codes):
         dirs = "".join(a.direction[0] for a in c.axis_info[:2])
         order = {"en": "", "ne": "", "ws": "wsu", "sw": "wsu", "es": "esu", "se": "esu", "wn": "wnu", "nw": "wnu"}
         axis = order.get(dirs, "")
-        if axis and not any(t.startswith("axis=") for t in keep):
+        # geodesy keeps x east or west and y north or south, whatever order
+        # EPSG lists them in (PROJ's +axis=swu is Krovak's southing first).
+        keep = [t for t in keep if not t.startswith("axis=")]
+        if axis:
             keep.append("axis=" + axis)
         rows.append("|".join([str(code), i.name.replace("|", "/"), str(base), " ".join(keep)]))
     return rows, skipped

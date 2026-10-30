@@ -58,14 +58,7 @@ public struct Crs {
     //   Longitude and latitude on this system's own datum (degrees, from
     //   Greenwich).
     fn toLonLat(_ x0: Float, _ y0: Float) -> (Float, Float) {
-        var x = x0
-        var y = y0
-        if axis.hasPrefix("w") {
-            x = -x
-        }
-        if axis.character(at: 1) == "s" {
-            y = -y
-        }
+        let (x, y) = axisIn(axis, x0, y0)
         if isGeographic() {
             return (angNormalize(x * angleUnit + primeMeridian), y * angleUnit)
         }
@@ -88,13 +81,7 @@ public struct Crs {
             x = px / toMeter
             y = py / toMeter
         }
-        if axis.hasPrefix("w") {
-            x = -x
-        }
-        if axis.character(at: 1) == "s" {
-            y = -y
-        }
-        (x, y)
+        axisOut(axis, x, y)
     }
 
     // toWGS84(x, y)
@@ -139,12 +126,12 @@ public struct Crs {
         let (xn2, yn2) = fromLonLat(lon, lat + h)
         let (xe1, ye1) = fromLonLat(lon - h, lat)
         let (xe2, ye2) = fromLonLat(lon + h, lat)
-        let sx = if axis.hasPrefix("w") { -1.0 } else { 1.0 }
-        let sy = if axis.character(at: 1) == "s" { -1.0 } else { 1.0 }
-        let dxn = (xn2 - xn1) * toMeter * sx
-        let dyn = (yn2 - yn1) * toMeter * sy
-        let dxe = (xe2 - xe1) * toMeter * sx
-        let dye = (ye2 - ye1) * toMeter * sy
+        let (exn, nyn) = axisIn(axis, xn2 - xn1, yn2 - yn1)
+        let (exe, nye) = axisIn(axis, xe2 - xe1, ye2 - ye1)
+        let dxn = exn * toMeter
+        let dyn = nyn * toMeter
+        let dxe = exe * toMeter
+        let dye = nye * toMeter
         let trueNorth = rho * 2.0 * h * degree
         let trueEast = nu * c * 2.0 * h * degree
         let h2 = hypot(dxn, dyn) / trueNorth
@@ -370,6 +357,20 @@ fn unitMetres(_ name: String) -> Float? {
     nil
 }
 
+// A meridian written to 8 or so digits (a WKT1 PRIMEM), snapped to the
+// one PROJ knows it as: Paris's 2.33722917 is 2°20'14.025".
+fn snapMeridian(_ degrees: Float) -> Float {
+    for row in meridianRows {
+        let f = row.split("|")
+        if let v = Float(f[1]) ?? readAngle(f[1]).value() {
+            if abs(v - degrees) < 1e-7 {
+                return v
+            }
+        }
+    }
+    degrees
+}
+
 fn meridianDegrees(_ name: String) -> Float? {
     if let v = Float(name) {
         return v
@@ -486,6 +487,29 @@ fn projAngle(_ p: [String: String], _ key: String, _ fallback: Float) -> Result<
     Result.ok(value: fallback)
 }
 
+// The signs of x and y for an axis string ("enu", "wsu", "swu", "neu"…):
+// x is always the east or west value and y the north or south one,
+// whatever order the letters come in.
+fn axisSigns(_ axis: String) -> (Float, Float) {
+    if axis == "enu" {
+        return (1.0, 1.0)
+    }
+    let two = axis.substring(from: 0, to: min(2, axis.count))
+    (if two.contains("w") { -1.0 } else { 1.0 }, if two.contains("s") { -1.0 } else { 1.0 })
+}
+
+// A system's (x, y) from easting and northing.
+fn axisOut(_ axis: String, _ e: Float, _ n: Float) -> (Float, Float) {
+    let (sx, sy) = axisSigns(axis)
+    (sx * e, sy * n)
+}
+
+// Easting and northing from a system's (x, y).
+fn axisIn(_ axis: String, _ x: Float, _ y: Float) -> (Float, Float) {
+    let (sx, sy) = axisSigns(axis)
+    (sx * x, sy * y)
+}
+
 // The projection part of a PROJ string, on a base system's datum.
 fn parseProjPart(_ text: String, _ base: Crs) -> Result<Crs> {
     let p = projTokens(text)
@@ -547,8 +571,18 @@ fn parseProjPart(_ text: String, _ base: Crs) -> Result<Crs> {
         let es = g.e2
         g = ellipsoid(a: g.a * (1.0 - es * (1.0 / 6.0 + es * (17.0 / 360.0 + es * 67.0 / 3024.0))), f: 0.0)
     }
-    let known = ["longlat", "tmerc", "merc", "webmerc", "lcc", "aea", "stere", "sterea", "laea", "eqc", "cass"]
-    if !known.contains(method) {
+    if method == "krovak" {
+        if p["lat_0"] == nil {
+            lat0 = 49.5
+        }
+        if p["lon_0"] == nil {
+            lon0 = 24.833333333333333
+        }
+        if p["k"] == nil && p["k_0"] == nil {
+            k0 = 0.9999
+        }
+    }
+    if !projectionMethods.contains(method) {
         return Result.failure(error: Error(if method.isEmpty { "the PROJ string has no +proj=" } else { "geodesy doesn't have the projection \"{method}\"" }))
     }
     var lat1u = lat1
@@ -567,6 +601,30 @@ fn parseProjPart(_ text: String, _ base: Crs) -> Result<Crs> {
         var hp = proj
         hp.hyperbolic = true
         c.projection = hp
+    }
+    let extras = ["alpha", "gamma", "lonc", "lon_1", "lon_2", "no_off", "no_uoff", "no_rot", "czech", "guam", "h_0", "azi"]
+    if !extras.filter({ k in p[k] != nil }).isEmpty || method == "omerc" {
+        var q = proj
+        if method == "omerc" {
+            if p["alpha"] != nil {
+                q.centralAzimuth = try projAngle(p, "alpha", 0.0)
+            }
+            if p["gamma"] != nil {
+                q.gridAngle = try projAngle(p, "gamma", 0.0)
+            }
+            q.lonc = try projAngle(p, "lonc", 0.0)
+            q.lon1 = try projAngle(p, "lon_1", 0.0)
+            q.lon2 = try projAngle(p, "lon_2", 0.0)
+            q.lat1 = lat1
+            q.lat2 = if lat2v.isNaN { 0.0 } else { lat2v }
+            q.noOff = p["no_off"] != nil || p["no_uoff"] != nil
+            q.noRot = p["no_rot"] != nil
+        }
+        q.czech = p["czech"] != nil
+        q.guam = p["guam"] != nil
+        q.h0 = Float(p["h_0"] ?? "0") ?? 0.0
+        q.azi = try projAngle(p, "azi", 0.0)
+        c.projection = prepared(q)
     }
     c.toMeter = toMeter
     c.axis = p["axis"] ?? "enu"
@@ -710,6 +768,37 @@ fn crsToProj(_ c: Crs) -> String {
         }
         if p.hyperbolic {
             parts.append("+hyperbolic")
+        }
+        if method == "omerc" {
+            if !p.centralAzimuth.isNaN || !p.gridAngle.isNaN {
+                parts.append("+lonc={p.lonc}")
+                if !p.centralAzimuth.isNaN {
+                    parts.append("+alpha={p.centralAzimuth}")
+                }
+                if !p.gridAngle.isNaN {
+                    parts.append("+gamma={p.gridAngle}")
+                }
+                if p.noOff {
+                    parts.append("+no_off")
+                }
+            } else {
+                parts.append("+lat_1={p.lat1} +lon_1={p.lon1} +lat_2={p.lat2} +lon_2={p.lon2}")
+            }
+            if p.noRot {
+                parts.append("+no_rot")
+            }
+        }
+        if p.czech {
+            parts.append("+czech")
+        }
+        if p.guam {
+            parts.append("+guam")
+        }
+        if method == "col_urban" {
+            parts.append("+h_0={p.h0}")
+        }
+        if method == "labrd" {
+            parts.append("+azi={p.azi}")
         }
         if p.k0 != 1.0 {
             parts.append("+k={p.k0}")

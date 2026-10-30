@@ -7,6 +7,6 @@ tessel = "0.10.0"
 # `tessel add geodesy`, then `import geodesy`.
 [library]
 name = "geodesy"
-version = "0.1.0"
-description = "Geodesy: exact distances, azimuths and areas on the ellipsoid (Karney), rhumb lines, map projections (UTM, TM, Lambert, Mercator, Albers, stereographic…), datum shifts, EPSG codes, PROJ strings, WKT, degrees as text and MGRS"
+version = "0.2.0"
+description = "Geodesy: exact distances, azimuths and areas on the ellipsoid (Karney), rhumb lines, map projections (UTM, TM, Lambert, Mercator, Albers, stereographic, oblique Mercator, Krovak, Swiss, polyconic, Equal Earth…), datum shifts, EPSG codes, PROJ strings, WKT, degrees as text and MGRS"
 license = "MIT"

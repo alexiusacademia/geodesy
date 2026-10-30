@@ -18,7 +18,7 @@ import warnings
 warnings.filterwarnings("ignore")
 import mgrs as mgrslib  # noqa: E402
 from geographiclib.geodesic import Geodesic  # noqa: E402
-from pyproj import CRS, Transformer  # noqa: E402
+from pyproj import CRS, Proj, Transformer  # noqa: E402
 from scipy.integrate import quad  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -235,6 +235,13 @@ def xy_transformer(src, dst):
             u, v = tf.transform(a, b)
             return v, u
         return t.transform(x, y)
+
+    def back(x, y):
+        if swap:
+            a, b = tf.transform(y, x, direction="INVERSE")
+            return (b, a) if src_ns else (a, b)
+        return t.transform(x, y, direction="INVERSE")
+    go.back = back
     return go
 
 
@@ -266,10 +273,14 @@ def projection_cases(rng):
         for lon, lat in area_points(rng, c, 3):
             try:
                 x, y = fwd((lon - pmdeg) / unit, lat / unit)
+                # PROJ's own inverse of (x, y): Laborde's and Colombia
+                # urban's inverses are formulas that miss the point by up
+                # to a millimetre, and geodesy has them as PROJ does.
+                ilon, ilat = fwd.back(x, y)
             except Exception:
                 continue
-            if math.isfinite(x) and math.isfinite(y):
-                pts.append([lon, lat, x, y])
+            if all(math.isfinite(v) for v in (x, y, ilon, ilat)):
+                pts.append([lon, lat, x, y, ilon * unit + pmdeg, ilat * unit])
         if pts:
             out.append({"code": code, "points": pts})
     return out
@@ -373,6 +384,12 @@ def cross_cases(rng):
                 return CRS.from_proj4(p4 + (" +towgs84=" + ",".join(repr(v) for v in sh) if sh else
                                             " +towgs84=0,0,0"))
             t = Transformer.from_crs(bound(A, ca), bound(B, cb), always_xy=True)
+            # From the point's latitude and longitude, not PROJ's inverse
+            # of (x, y), which for some projections (laea, aea) is a series
+            # a millimetre out.
+            datum = [tok for tok in bound(A, ca).to_proj4().split()
+                     if tok.lstrip("+").split("=")[0] in ("ellps", "datum", "a", "b", "rf", "f", "pm", "towgs84")]
+            tg = Transformer.from_crs(CRS.from_proj4("+proj=longlat " + " ".join(datum)), bound(B, cb), always_xy=True)
             fa = xy_transformer(A.geodetic_crs, A)
             g = base_of(int(a.split("|")[2]))
             pmdeg = float(g[4])
@@ -385,7 +402,7 @@ def cross_cases(rng):
             if not (w2 <= lon <= e2 and s2 <= lat <= n2):
                 continue
             x, y = fa((lon - pmdeg) / unit, lat / unit)
-            u, v = t.transform(x, y)
+            u, v = tg.transform(lon - pmdeg, lat)
             if all(math.isfinite(q) for q in (x, y, u, v)):
                 pts.append([x, y, u, v])
         if pts:
@@ -398,8 +415,11 @@ def text_cases(rng):
     proj = rows("projectedRows")
     geo = {int(r.split("|")[0]): r for r in rows("geographicRows")}
     out = []
-    for _ in range(600):
-        r = rng.choice(proj)
+    # One of each method geodesy has, read every way, then 600 at random.
+    each = [3078, 2057, 3375, 29874, 2065, 5514, 2056, 6247, 5880, 8857, 6933, 3410, 29701, 29702, 27200, 3993, 3295,
+            3123, 25391, 3857, 2154, 3035, 3031, 28992, 32662, 30200]
+    by_code = {int(r.split("|")[0]): r for r in proj}
+    for r in [by_code[k] for k in each if k in by_code] + [rng.choice(proj) for _ in range(600)]:
         code = int(r.split("|")[0])
         try:
             c = CRS.from_epsg(code)
@@ -411,7 +431,16 @@ def text_cases(rng):
             continue
         sh = shift_of(geo[int(r.split("|")[2])])
         p4 = c.to_proj4() + (" +towgs84=" + ",".join(repr(v) for v in sh) if sh else "")
+        # PROJ leaves the axis out of some systems' strings (Gusterberg's
+        # south, west); geodesy's +axis gives the directions of x and y.
+        dirs = "".join(a.direction[0] for a in c.axis_info[:2])
+        order = {"ws": "wsu", "sw": "wsu", "es": "esu", "se": "esu", "wn": "wnu", "nw": "wnu"}
+        p4 = " ".join(t for t in p4.split() if not t.startswith("+axis="))
+        if dirs in order:
+            p4 += " +axis=" + order[dirs]
         texts = [("proj", p4)]
+        # geodesy's x is east or west and y north or south, in either order.
+        want_dirs = sorted(a.direction for a in c.axis_info[:2])
         for flavour in ("WKT1_GDAL", "WKT1_ESRI", "WKT2_2019"):
             try:
                 w = c.to_wkt(flavour)
@@ -419,6 +448,14 @@ def text_cases(rng):
                 continue
             if not w:
                 continue
+            # Some WKT can't carry the axes (Esri's never does; GDAL's
+            # leaves Gusterberg's south and west out): PROJ reads those as
+            # east and north too, so they aren't the EPSG system.
+            try:
+                if sorted(a.direction for a in CRS.from_wkt(w).axis_info[:2]) != want_dirs:
+                    continue
+            except Exception:
+                pass
             texts.append((flavour, w))
             # Without its EPSG codes, to read the parameters themselves.
             stripped = re.sub(r',\s*(AUTHORITY|ID)\["EPSG",\s*"?\d+"?\]', "", w)
@@ -431,6 +468,48 @@ def text_cases(rng):
                 pts.append([lon, lat, x, y])
         if pts:
             out.append({"code": code, "texts": [[k, t] for k, t in texts], "points": pts})
+    return out
+
+
+# PROJ strings for what no EPSG system uses: polar and spherical azimuthal
+# equidistant, spherical polyconic and Equal Earth, Hotine by two points,
+# without rotation and south of the equator, Krovak's
+# +czech, cea's +k_0, Swiss oblique Mercator in the south.
+STRINGS = [
+    ("+proj=aeqd +lat_0=90 +lon_0=0 +ellps=WGS84", (-180, 180), (50, 89)),
+    ("+proj=aeqd +lat_0=-90 +lon_0=30 +ellps=intl", (-180, 180), (-89, -50)),
+    ("+proj=aeqd +lat_0=0 +lon_0=10 +ellps=WGS84", (-60, 80), (-60, 60)),
+    ("+proj=aeqd +lat_0=40 +lon_0=-100 +R=6371000", (-150, -50), (0, 80)),
+    ("+proj=poly +lat_0=10 +lon_0=20 +R=6371000", (0, 40), (-20, 50)),
+    ("+proj=poly +lat_0=-30 +lon_0=-60 +x_0=1000000 +ellps=intl", (-80, -40), (-50, -1)),
+    ("+proj=eqearth +lon_0=0 +R=6371000", (-180, 180), (-85, 85)),
+    ("+proj=eqearth +lon_0=150 +ellps=GRS80", (-30, 330), (-85, 85)),
+    ("+proj=omerc +lat_0=40 +lat_1=38 +lon_1=-100 +lat_2=42 +lon_2=-90 +k=0.9996 +ellps=GRS80", (-105, -85), (35, 45)),
+    ("+proj=omerc +lat_0=4 +lonc=102.25 +alpha=323.025796466667 +k=0.99984 +no_rot +ellps=GRS80", (100, 105), (1, 7)),
+    ("+proj=omerc +lat_0=-30 +lonc=140 +alpha=30 +k=1 +x_0=500000 +ellps=WGS84", (135, 145), (-35, -25)),
+    ("+proj=omerc +lat_0=-30 +lonc=140 +alpha=30 +no_off +ellps=WGS84", (135, 145), (-35, -25)),
+    ("+proj=krovak +czech +ellps=bessel", (12, 22), (47, 51)),
+    ("+proj=cea +lon_0=0 +k_0=0.9 +ellps=GRS80", (-180, 180), (-80, 80)),
+    ("+proj=somerc +lat_0=-20 +lon_0=30 +k_0=0.9999 +x_0=100000 +ellps=WGS84", (25, 35), (-25, -15)),
+    ("+proj=nzmg +ellps=intl", (166, 179), (-47, -34)),
+]
+
+
+def string_cases(rng):
+    out = []
+    for text, (w, e), (s_, n) in STRINGS:
+        # The PROJ string itself, not pyproj's CRS made from it, which
+        # reads some (Krovak's +czech) differently.
+        P = Proj(text)
+        pts = []
+        for _ in range(20):
+            lon = round(rng.uniform(w, e), 9)
+            lat = round(rng.uniform(s_, n), 9)
+            x, y = P(lon, lat)
+            ilon, ilat = P(x, y, inverse=True)
+            if all(math.isfinite(v) for v in (x, y, ilon, ilat)):
+                pts.append([((lon + 180) % 360) - 180, lat, x, y, ilon, ilat])
+        out.append({"text": text, "points": pts})
     return out
 
 
@@ -468,6 +547,7 @@ def main():
     cases["cross"] = cross_cases(rng)
     cases["texts"] = text_cases(rng)
     cases["mgrs"] = mgrs_cases(rng)
+    cases["strings"] = string_cases(rng)
     path = os.path.join(ROOT, "tests", "cases.json")
     with open(path, "w") as f:
         json.dump(cases, f, separators=(",", ":"))

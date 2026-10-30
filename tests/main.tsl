@@ -67,6 +67,11 @@ struct CrossCase {
     points: [[Float]]
 }
 
+struct StringCase {
+    text: String
+    points: [[Float]]
+}
+
 struct TextCase {
     code: Int
     texts: [[String]]
@@ -92,6 +97,7 @@ struct Cases {
     cross: [CrossCase]
     texts: [TextCase]
     mgrs: [MgrsCase]
+    strings: [StringCase]
 }
 
 // The checks made, the ones that failed, and the largest difference of
@@ -221,8 +227,16 @@ fn testProjections(_ t: bind Tally, _ cases: Cases) {
                 t.check("{kind} forward (m)", "EPSG:{c.code} at {p[0]},{p[1]}", x * scale, p[2] * scale, 1e-6)
                 t.check("{kind} forward (m)", "EPSG:{c.code} at {p[0]},{p[1]}", y * scale, p[3] * scale, 1e-6)
                 let (lon, lat) = crs.toLonLat(p[2], p[3])
-                t.checkAngle("{kind} inverse (°)", "EPSG:{c.code} at {p[2]},{p[3]}", lon, p[0], 1e-9)
-                t.check("{kind} inverse (°)", "EPSG:{c.code} at {p[2]},{p[3]}", lat, p[1], 1e-9)
+                // Back to the point, or for Laborde and Colombia urban,
+                // whose inverses are approximate formulas, to PROJ's own
+                // inverse of the same (x, y).
+                let formula = kind == "labrd" || kind == "col_urban"
+                t.checkAngle("{kind} inverse (°)", "EPSG:{c.code} at {p[2]},{p[3]}", lon, if formula { p[4] } else { p[0] }, 1e-9)
+                t.check("{kind} inverse (°)", "EPSG:{c.code} at {p[2]},{p[3]}", lat, if formula { p[5] } else { p[1] }, 1e-9)
+                if formula {
+                    t.checkAngle("{kind} inverse near (°)", "EPSG:{c.code} at {p[2]},{p[3]}", lon, p[0], 1e-6)
+                    t.check("{kind} inverse near (°)", "EPSG:{c.code} at {p[2]},{p[3]}", lat, p[1], 1e-6)
+                }
             }
         } else {
             t.checkTrue("EPSG:{c.code} is in the table", false)
@@ -277,8 +291,8 @@ fn testProjections(_ t: bind Tally, _ cases: Cases) {
                         .ok(back) -> {
                             let p = c.points[0]
                             let (x, y) = back.fromLonLat(p[0], p[1])
-                            t.check("WKT written and read back (m)", "EPSG:{c.code}", x * back.toMeter, p[2] * crs.toMeter, 1e-6)
-                            t.check("WKT written and read back (m)", "EPSG:{c.code}", y * back.toMeter, p[3] * crs.toMeter, 1e-6)
+                            t.check("WKT written and read back (m)", "EPSG:{c.code} from {kind}", x * back.toMeter, p[2] * crs.toMeter, 1e-6)
+                            t.check("WKT written and read back (m)", "EPSG:{c.code} from {kind}", y * back.toMeter, p[3] * crs.toMeter, 1e-6)
                         }
                         .failure(e) -> t.checkTrue("EPSG:{c.code} WKT written and read back: {e.message}", false)
                     }
@@ -286,8 +300,8 @@ fn testProjections(_ t: bind Tally, _ cases: Cases) {
                         .ok(back) -> {
                             let p = c.points[0]
                             let (x, y) = back.fromLonLat(p[0], p[1])
-                            t.check("PROJ string written and read back (m)", "EPSG:{c.code}", x * back.toMeter, p[2] * crs.toMeter, 1e-6)
-                            t.check("PROJ string written and read back (m)", "EPSG:{c.code}", y * back.toMeter, p[3] * crs.toMeter, 1e-6)
+                            t.check("PROJ string written and read back (m)", "EPSG:{c.code} from {kind}", x * back.toMeter, p[2] * crs.toMeter, 1e-6)
+                            t.check("PROJ string written and read back (m)", "EPSG:{c.code} from {kind}", y * back.toMeter, p[3] * crs.toMeter, 1e-6)
                         }
                         .failure(e) -> t.checkTrue("EPSG:{c.code} PROJ string written and read back: {e.message}", false)
                     }
@@ -338,10 +352,53 @@ fn testCases(_ t: bind Tally) {
         return
     }
     let cases = loaded ?? Cases(geodesics: [], lines: [], polygons: [], rhumbs: [], projections: [],
-                                datums: [], cross: [], texts: [], mgrs: [])
+                                datums: [], cross: [], texts: [], mgrs: [], strings: [])
     testGeodesics(t, cases)
     testProjections(t, cases)
+    testStrings(t, cases)
+    testGammaOnly(t)
     testMgrs(t, cases)
+}
+
+// Hotine by gamma alone is the same system as with the alpha it implies
+// (PROJ 9.3.0 leaves that grid unrectified, against its own docs).
+fn testGammaOnly(_ t: bind Tally) {
+    let both = geodesy.fromProj("+proj=omerc +lat_0=4 +lonc=115 +alpha=53.3158204722222 +gamma=53.1301023611111 +k=0.99984 +ellps=evrstSS")
+    let alone = geodesy.fromProj("+proj=omerc +lat_0=4 +lonc=115 +gamma=53.1301023611111 +k=0.99984 +ellps=evrstSS")
+    if let b = both.value() {
+        if let a = alone.value() {
+            for (lon, lat) in [(115.0, 4.0), (115.0, 5.0), (112.3, 1.5), (118.9, 6.8)] {
+                let (x1, y1) = b.fromLonLat(lon, lat)
+                let (x2, y2) = a.fromLonLat(lon, lat)
+                t.check("omerc by gamma alone (m)", "at {lon},{lat}", x2, x1, 1e-3)
+                t.check("omerc by gamma alone (m)", "at {lon},{lat}", y2, y1, 1e-3)
+            }
+            return
+        }
+    }
+    t.checkTrue("omerc by gamma alone reads", false)
+}
+
+// PROJ strings for what no EPSG system uses, forward and back.
+fn testStrings(_ t: bind Tally, _ cases: Cases) {
+    for c in cases.strings {
+        match geodesy.fromProj(c.text) {
+            .ok(crs) -> {
+                let kind = crs.projection.method
+                for p in c.points {
+                    let (x, y) = crs.fromLonLat(p[0], p[1])
+                    t.check("{kind} by PROJ string (m)", "{c.text} at {p[0]},{p[1]}", x, p[2], 1e-6)
+                    t.check("{kind} by PROJ string (m)", "{c.text} at {p[0]},{p[1]}", y, p[3], 1e-6)
+                    // Back to the point (PROJ's own cea and Equal Earth
+                    // inverses are series, a millimetre out).
+                    let (lon, lat) = crs.toLonLat(p[2], p[3])
+                    t.checkAngle("{kind} by PROJ string, back (°)", "{c.text} at {p[2]},{p[3]}", lon, p[0], 1e-9)
+                    t.check("{kind} by PROJ string, back (°)", "{c.text} at {p[2]},{p[3]}", lat, p[1], 1e-9)
+                }
+            }
+            .failure(e) -> t.checkTrue("{c.text}: {e.message}", false)
+        }
+    }
 }
 
 // Angles and positions as text.
@@ -430,7 +487,8 @@ fn testSystems(_ t: bind Tally) {
     t.checkTrue("epsg of an unknown code is nil", geodesy.epsg(99999) == nil)
     t.checkTrue("crs(EPSG:3123)", geodesy.crs("EPSG:3123").isOk() && geodesy.crs("epsg: 4326").isOk())
     t.checkTrue("crs of an unknown code fails", !geodesy.crs("EPSG:99999").isOk())
-    t.checkTrue("Hotine oblique Mercator isn't there (yet)", geodesy.epsg(3375) == nil)
+    t.checkTrue("Hotine oblique Mercator: EPSG:3375 (Peninsular RSO)", geodesy.epsg(3375) != nil)
+    t.checkTrue("a projection geodesy doesn't have fails", !geodesy.fromProj("+proj=robin +lon_0=0").isOk())
     t.checkTrue("ellipsoidNamed clrk66", (geodesy.ellipsoidNamed("clrk66")?.a ?? 0.0) == 6378206.4)
     t.checkTrue("ellipsoidNamed of junk", geodesy.ellipsoidNamed("frob") == nil)
     t.checkTrue("ellipsoidNames", geodesy.ellipsoidNames().contains("GRS80"))

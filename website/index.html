@@ -53,7 +53,7 @@
     <div>
       <p class="eyebrow">A Tessel library</p>
       <h1>Geodesy for Tessel apps.</h1>
-      <p class="lede">Exact distances, azimuths and areas on the ellipsoid by Karney's algorithms. Map projections and datum shifts that agree with PROJ to the nanometre for all 5144 EPSG projected systems it has, the Philippine PRS92 and Luzon 1911 zones among them. PROJ strings and .prj files, grid-to-ground factors, degrees as text and MGRS.</p>
+      <p class="lede">Exact distances, azimuths and areas on the ellipsoid by Karney's algorithms. Map projections and datum shifts that agree with PROJ to the nanometre for all 5230 EPSG projected systems it has, the Philippine PRS92 and Luzon 1911 zones among them. PROJ strings and .prj files, grid-to-ground factors, degrees as text and MGRS.</p>
       <div class="install">
         <code>tessel add geodesy</code>
         <button class="copy" type="button" data-copy="tessel add geodesy">Copy</button>
@@ -101,7 +101,7 @@ let (k, _, convergence) = zone3.gridFactors(121.5, 14.6)</pre>
       <article class="fcard">
         <div class="body">
           <h3>EPSG codes, PROJ strings and .prj files</h3>
-          <p>578 geographic and 5144 projected EPSG systems, with the shift to WGS84 that PROJ itself picks. Or read a PROJ string, or the WKT in a shapefile's .prj (GDAL's, Esri's or WKT2): an Esri .prj with no shift finds its datum's by name.</p>
+          <p>578 geographic and 5230 projected EPSG systems, with the shift to WGS84 that PROJ itself picks. Or read a PROJ string, or the WKT in a shapefile's .prj (GDAL's, Esri's or WKT2): an Esri .prj with no shift finds its datum's by name.</p>
 <pre class="tsl">let c = try geodesy.crs("EPSG:3123")
 let d = try geodesy.fromProj("+proj=utm +zone=51 +datum=WGS84")
 let e = try geodesy.fromWkt(readFile("lots.prj") ?? "")
@@ -181,8 +181,11 @@ fn main() {
       <tr><td>Albers equal-area, Lambert azimuthal equal-area</td><td>Continental and statistical maps</td></tr>
       <tr><td>Stereographic: polar, oblique, equatorial; oblique on the Gauss sphere</td><td>Polar maps, the Netherlands, Romania, New Brunswick</td></tr>
       <tr><td>Cassini–Soldner (and EPSG's hyperbolic variant), equidistant cylindrical</td><td>Old cadastral grids</td></tr>
+      <tr><td>Hotine oblique Mercator (variants A and B, two-point), Swiss oblique Mercator, Laborde</td><td>Malaysia and Borneo RSO, Michigan, Switzerland, Madagascar</td></tr>
+      <tr><td>Krovak (both orientations), American polyconic, Colombia urban, New Zealand Map Grid</td><td>Czechia and Slovakia, Brazil, Colombian cities, New Zealand</td></tr>
+      <tr><td>Azimuthal equidistant (and Guam's), cylindrical equal-area, Equal Earth</td><td>Pacific islands, EASE-Grid, world maps</td></tr>
     </table></div>
-    <p class="intro" style="margin-top:16px">Datum shifts are 7-parameter Helmert transformations through WGS84, the one PROJ picks for each datum from the EPSG database (418 of 578), with PROJ's own ellipsoids and prime meridians. Not yet: Hotine oblique Mercator, Krovak and the Swiss projection (114 EPSG systems).</p>
+    <p class="intro" style="margin-top:16px">Datum shifts are 7-parameter Helmert transformations through WGS84, the one PROJ picks for each datum from the EPSG database (418 of 578), with PROJ's own ellipsoids and prime meridians.</p>
   </div>
 </section>
 
@@ -191,8 +194,8 @@ fn main() {
     <h2>Checked against GeographicLib and PROJ</h2>
     <p class="intro">Python programs ask GeographicLib, PROJ (through pyproj), SciPy and the mgrs package for the answers to thousands of cases, and geodesy has to agree with every one.</p>
     <div class="stats">
-      <div class="stat"><b>138,677</b><span>checks in the library's tests, all passing</span></div>
-      <div class="stat"><b>5,144</b><span>EPSG projected systems, every one checked forward and back</span></div>
+      <div class="stat"><b>142,230</b><span>checks in the library's tests, all passing</span></div>
+      <div class="stat"><b>5,230</b><span>EPSG projected systems, every one checked forward and back</span></div>
       <div class="stat"><b>0.1 µm</b><span>the largest difference from PROJ in any projection</span></div>
       <div class="stat"><b>0.13 s</b><span>for 100,000 transforms with a datum shift</span></div>
     </div>

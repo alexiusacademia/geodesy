@@ -186,8 +186,23 @@ fn wktGeographic(_ g: WktNode) -> Result<Crs> {
         return Result.failure(error: Error("the WKT's ellipsoid needs a radius and an inverse flattening"))
     }
     let lengthUnit = wktUnit(sph, ["LENGTHUNIT", "UNIT"], 1.0)
-    let a = sph.numbers[0] * lengthUnit
-    let rf = sph.numbers[1]
+    var a = sph.numbers[0] * lengthUnit
+    var rf = sph.numbers[1]
+    // Within 1e-10 of one of PROJ's named ellipsoids: that one, as PROJ
+    // uses for the EPSG system (Bessel Namibia's 6377483.86528042 is
+    // PROJ's 6377483.865).
+    if rf != 0.0 {
+        for n in ellipsoidNames() {
+            if let named = ellipsoidNamed(n) {
+                let nrf = named.inverseFlattening()
+                if nrf != 0.0 && abs(named.a / a - 1.0) < 1e-10 && abs(nrf / rf - 1.0) < 1e-10 {
+                    a = named.a
+                    rf = nrf
+                    break
+                }
+            }
+        }
+    }
     let e = ellipsoid(a: a, f: if rf == 0.0 { 0.0 } else { 1.0 / rf }, name: sph.name())
     var shift: [Float] = []
     var known = false
@@ -242,7 +257,7 @@ fn wktGeographic(_ g: WktNode) -> Result<Crs> {
         // WKT2 gives the meridian's unit; WKT1 writers (GDAL, Esri) put it
         // in degrees, whatever the system's angle unit.
         let pmUnit = wktUnit(pmn, ["ANGLEUNIT", "UNIT"], degree)
-        pm = (pmn.numbers.first ?? 0.0) * pmUnit / degree
+        pm = snapMeridian((pmn.numbers.first ?? 0.0) * pmUnit / degree)
     }
     Result.ok(value: Crs(name: g.name(), code: code, projection: prepared(Projection(method: "longlat", ellipsoid: e)),
                          shift: shift, shiftKnown: known, primeMeridian: pm, angleUnit: angle / degree,
@@ -285,8 +300,30 @@ fn wktParamKey(_ name: String) -> String {
     if ["standardparallel2", "latitudeof2ndstandardparallel"].contains(n) {
         return "lat2"
     }
-    if ["scalefactor", "scalefactoratnaturalorigin", "scalefactoronpseudostandardparallel"].contains(n) {
+    if ["scalefactor", "scalefactoratnaturalorigin", "scalefactoronpseudostandardparallel", "scalefactoroninitialline",
+        "ellipsoidscalingfactor"].contains(n) {
         return "k0"
+    }
+    if ["azimuth", "azimuthofinitialline", "azimuthofcentralline"].contains(n) {
+        return "azimuth"
+    }
+    if ["rectifiedgridangle", "anglefromrectifiedtoskewgrid", "xyplanerotation"].contains(n) {
+        return "gamma"
+    }
+    if ["height", "projectionplaneoriginheight"].contains(n) {
+        return "h0"
+    }
+    if ["latitudeofpoint1", "latitudeof1stpoint"].contains(n) {
+        return "latP1"
+    }
+    if ["longitudeofpoint1", "longitudeof1stpoint"].contains(n) {
+        return "lonP1"
+    }
+    if ["latitudeofpoint2", "latitudeof2ndpoint"].contains(n) {
+        return "latP2"
+    }
+    if ["longitudeofpoint2", "longitudeof2ndpoint"].contains(n) {
+        return "lonP2"
     }
     if ["falseeasting", "eastingatfalseorigin", "eastingatprojectioncentre"].contains(n) {
         return "x0"
@@ -418,7 +455,10 @@ fn wktProjection(_ top: WktNode, _ base: Crs) -> Result<Crs> {
             }
         } else if key == "x0" || key == "y0" {
             x = x * linear
-        } else if key == "lat0" || key == "lon0" || key == "lat1" || key == "lat2" || key == "latNatural" || key == "latFalse" {
+        } else if ["lat0", "lon0", "lat1", "lat2", "latNatural", "latFalse", "azimuth", "gamma", "latP1", "lonP1", "latP2",
+                   "lonP2"].contains(key) {
+            // Esri writes Hotine's rectified grid angle as XY_Plane_Rotation
+            // in degrees too; all of them follow the system's angle unit.
             x = x * angleDeg
         }
         v[key] = x
@@ -440,6 +480,10 @@ fn wktProjection(_ top: WktNode, _ base: Crs) -> Result<Crs> {
             axis = "wsu"
         }
     } else if m == "mercatorauxiliarysphere" || m.contains("pseudomercator") {
+        method = "webmerc"
+    } else if m.hasPrefix("mercator") && wktProj4(top).contains("+proj=merc") && wktProj4(top).contains("+nadgrids=@null") {
+        // GDAL's Web Mercator: Mercator_1SP with the PROJ string of a
+        // sphere in an EXTENSION.
         method = "webmerc"
     } else if m.hasPrefix("mercator") {
         method = "merc"
@@ -486,6 +530,33 @@ fn wktProjection(_ top: WktNode, _ base: Crs) -> Result<Crs> {
         latTs = v["lat1"] ?? 0.0
     } else if m.hasPrefix("cassini") {
         method = "cass"
+    } else if m.hasPrefix("hotineobliquemercator") || m.hasPrefix("rectifiedskeworthomorphic") || m.hasPrefix("obliquemercator") {
+        method = "omerc"
+        // An azimuth of 90° at the centre is the Swiss oblique Mercator,
+        // as PROJ reads it.
+        if !m.contains("twopoint") && v["azimuth"] == 90.0 && (v["gamma"] ?? 90.0) == 90.0 {
+            method = "somerc"
+        }
+    } else if m.hasPrefix("swissobliquecylindrical") || m.hasPrefix("swissobliquemercator") || m == "somerc" {
+        method = "somerc"
+    } else if m.hasPrefix("krovak") {
+        method = "krovak"
+    } else if m.hasPrefix("colombiaurban") || m.hasPrefix("igacplanocartesiano") {
+        method = "col_urban"
+        lat0 = v["latNatural"] ?? v["lat0"] ?? 0.0
+    } else if m.hasPrefix("polyconic") || m.hasPrefix("americanpolyconic") {
+        method = "poly"
+    } else if m.hasPrefix("equalearth") {
+        method = "eqearth"
+    } else if m.hasPrefix("cylindricalequalarea") || m.hasPrefix("lambertcylindricalequalarea") || m == "behrmann" {
+        method = "cea"
+        latTs = v["lat1"] ?? (if m == "behrmann" { 30.0 } else { 0.0 })
+    } else if m.hasPrefix("labordeobliquemercator") || m == "laborde" {
+        method = "labrd"
+    } else if m.hasPrefix("newzealandmapgrid") {
+        method = "nzmg"
+    } else if m.hasPrefix("azimuthalequidistant") || m.hasPrefix("modifiedazimuthalequidistant") || m.hasPrefix("guam") {
+        method = "aeqd"
     } else {
         return Result.failure(error: Error("geodesy doesn't have the projection \"{methodName}\""))
     }
@@ -502,10 +573,49 @@ fn wktProjection(_ top: WktNode, _ base: Crs) -> Result<Crs> {
     if axis == "enu" && ew.count == 1 && ns.count == 1 {
         axis = ew[0].substring(from: 0, to: 1) + ns[0].substring(from: 0, to: 1) + "u"
     }
-    let p = prepared(Projection(method: method, ellipsoid: g, lat0: lat0, lon0: v["lon0"] ?? 0.0, lat1: lat1,
-                                lat2: if lat2.isNaN { 0.0 } else { lat2 }, latTs: if latTs.isNaN { 0.0 } else { latTs },
-                                k0: k0, x0: v["x0"] ?? 0.0, y0: v["y0"] ?? 0.0, hasLat2: !lat2.isNaN,
-                                hasLatTs: !latTs.isNaN))
+    var q = Projection(method: method, ellipsoid: g, lat0: lat0, lon0: v["lon0"] ?? 0.0, lat1: lat1,
+                       lat2: if lat2.isNaN { 0.0 } else { lat2 }, latTs: if latTs.isNaN { 0.0 } else { latTs },
+                       k0: k0, x0: v["x0"] ?? 0.0, y0: v["y0"] ?? 0.0, hasLat2: !lat2.isNaN,
+                       hasLatTs: !latTs.isNaN)
+    if method == "omerc" {
+        if m.contains("twopoint") {
+            q.lat1 = v["latP1"] ?? 0.0
+            q.lon1 = v["lonP1"] ?? 0.0
+            q.lat2 = v["latP2"] ?? 0.0
+            q.lon2 = v["lonP2"] ?? 0.0
+        } else {
+            q.centralAzimuth = v["azimuth"] ?? 0.0
+            if let gm = v["gamma"] {
+                q.gridAngle = gm
+            }
+            q.lonc = v["lon0"] ?? 0.0
+        }
+        // EPSG's variant A (GDAL's plain Hotine_Oblique_Mercator, Esri's
+        // natural origin) has its false origin at the natural origin.
+        q.noOff = m.contains("varianta") || m.contains("naturalorigin") || m == "hotinemercator" || m == "hotineobliquemercator" ||
+            m == "rectifiedskeworthomorphic"
+    }
+    if method == "labrd" {
+        q.azi = v["azimuth"] ?? 0.0
+    }
+    if method == "col_urban" {
+        q.h0 = v["h0"] ?? 0.0
+    }
+    if method == "aeqd" && m.hasPrefix("guam") {
+        q.guam = true
+    }
+    if method == "krovak" {
+        if v["k0"] == nil {
+            q.k0 = 0.9999
+        }
+        // Classic Krovak is positive south and west; the North Orientated
+        // one (Esri's X_Scale -1 turned 90°) east and north, as PROJ gives
+        // it. With axes, those say which.
+        if top.all(["AXIS"]).isEmpty && !(v["xscale"] == -1.0 && v["gamma"] == 90.0) {
+            axis = "wsu"
+        }
+    }
+    let p = prepared(q)
     var c = base
     c.name = top.name()
     c.code = 0
@@ -513,6 +623,16 @@ fn wktProjection(_ top: WktNode, _ base: Crs) -> Result<Crs> {
     c.toMeter = linear
     c.axis = axis
     Result.ok(value: c)
+}
+
+// The PROJ string of GDAL's EXTENSION["PROJ4", "…"], or "".
+fn wktProj4(_ top: WktNode) -> String {
+    for e in top.all(["EXTENSION"]) {
+        if e.texts.count >= 2 && e.texts[0] == "PROJ4" {
+            return e.texts[1]
+        }
+    }
+    ""
 }
 
 fn wktNumber(_ x: Float) -> String {
@@ -531,11 +651,12 @@ fn crsToWkt(_ c: Crs) -> String {
     }
     datum += "]"
     let angle = c.angleUnit * degree
+    // PRIMEM is in degrees in WKT1 (GDAL's and Esri's), whatever the unit.
     let unitName = if c.angleUnit == 1.0 { "degree" } else if abs(c.angleUnit - 0.9) < 1e-12 { "grad" } else { "unit" }
-    let geog = "GEOGCS[\"{c.datumName}\",{datum},PRIMEM[\"{if c.primeMeridian == 0.0 { "Greenwich" } else { "unnamed" }}\",{wktNumber(c.primeMeridian / c.angleUnit)}],UNIT[\"{unitName}\",{angle}]]"
+    let geog = "GEOGCS[\"{c.datumName}\",{datum},PRIMEM[\"{if c.primeMeridian == 0.0 { "Greenwich" } else { "unnamed" }}\",{wktNumber(c.primeMeridian)}],UNIT[\"{unitName}\",{angle}]]"
     if c.isGeographic() {
         let auth = if c.code != 0 { ",AUTHORITY[\"EPSG\",\"{c.code}\"]" } else { "" }
-        return "GEOGCS[\"{c.name}\",{datum},PRIMEM[\"{if c.primeMeridian == 0.0 { "Greenwich" } else { "unnamed" }}\",{wktNumber(c.primeMeridian / c.angleUnit)}],UNIT[\"{unitName}\",{angle}],AXIS[\"Longitude\",EAST],AXIS[\"Latitude\",NORTH]{auth}]"
+        return "GEOGCS[\"{c.name}\",{datum},PRIMEM[\"{if c.primeMeridian == 0.0 { "Greenwich" } else { "unnamed" }}\",{wktNumber(c.primeMeridian)}],UNIT[\"{unitName}\",{angle}],AXIS[\"Longitude\",EAST],AXIS[\"Latitude\",NORTH]{auth}]"
     }
     let p = c.projection
     var params: [(String, Float)] = []
@@ -555,8 +676,9 @@ fn crsToWkt(_ c: Crs) -> String {
             }
         }
         "webmerc" -> {
-            name = "Mercator_1SP"
-            params = [("central_meridian", p.lon0), ("scale_factor", 1.0)]
+            // Esri's name, which GDAL and QGIS read too.
+            name = "Mercator_Auxiliary_Sphere"
+            params = [("central_meridian", p.lon0), ("standard_parallel_1", 0.0), ("auxiliary_sphere_type", 0.0)]
         }
         "lcc" -> {
             if !p.hasLat2 && p.lat1 != p.lat0 && p.k0 == 1.0 {
@@ -567,6 +689,10 @@ fn crsToWkt(_ c: Crs) -> String {
             } else if p.hasLat2 {
                 name = "Lambert_Conformal_Conic_2SP"
                 params = [("standard_parallel_1", p.lat1), ("standard_parallel_2", p.lat2), ("latitude_of_origin", p.lat0), ("central_meridian", p.lon0)]
+                if p.k0 != 1.0 {
+                    // Michigan's: the ellipsoid scaled (Esri's Scale_Factor).
+                    params.append(("scale_factor", p.k0))
+                }
             } else {
                 name = "Lambert_Conformal_Conic_1SP"
                 params = [("latitude_of_origin", p.lat0), ("central_meridian", p.lon0), ("scale_factor", p.k0)]
@@ -607,19 +733,77 @@ fn crsToWkt(_ c: Crs) -> String {
             name = "Cassini_Soldner"
             params = [("latitude_of_origin", p.lat0), ("central_meridian", p.lon0)]
         }
+        "omerc" -> {
+            if p.centralAzimuth.isNaN && p.gridAngle.isNaN {
+                name = "Hotine_Oblique_Mercator_Two_Point_Natural_Origin"
+                params = [("latitude_of_center", p.lat0), ("latitude_of_point_1", p.lat1), ("longitude_of_point_1", p.lon1),
+                          ("latitude_of_point_2", p.lat2), ("longitude_of_point_2", p.lon2), ("scale_factor", p.k0)]
+            } else {
+                name = if p.noOff { "Hotine_Oblique_Mercator" } else { "Hotine_Oblique_Mercator_Azimuth_Center" }
+                params = [("latitude_of_center", p.lat0), ("longitude_of_center", p.lonc)]
+                if !p.centralAzimuth.isNaN {
+                    params.append(("azimuth", p.centralAzimuth))
+                }
+                if !p.gridAngle.isNaN {
+                    params.append(("rectified_grid_angle", p.gridAngle))
+                }
+                params.append(("scale_factor", p.k0))
+            }
+        }
+        "somerc" -> {
+            name = "Hotine_Oblique_Mercator_Azimuth_Center"
+            params = [("latitude_of_center", p.lat0), ("longitude_of_center", p.lon0), ("azimuth", 90.0),
+                      ("rectified_grid_angle", 90.0), ("scale_factor", p.k0)]
+        }
+        "krovak" -> {
+            name = "Krovak"
+            params = [("latitude_of_center", p.lat0), ("longitude_of_center", p.lon0), ("azimuth", 30.2881397527778),
+                      ("pseudo_standard_parallel_1", 78.5), ("scale_factor", p.k0)]
+        }
+        "col_urban" -> {
+            name = "Colombia_Urban"
+            params = [("latitude_of_origin", p.lat0), ("central_meridian", p.lon0), ("height", p.h0)]
+        }
+        "poly" -> {
+            name = "Polyconic"
+            params = [("latitude_of_origin", p.lat0), ("central_meridian", p.lon0)]
+        }
+        "aeqd" -> {
+            name = if p.guam { "Guam_Projection" } else { "Azimuthal_Equidistant" }
+            params = [("latitude_of_center", p.lat0), ("longitude_of_center", p.lon0)]
+        }
+        "cea" -> {
+            name = "Cylindrical_Equal_Area"
+            params = [("standard_parallel_1", if p.hasLatTs { p.latTs } else { 0.0 }), ("central_meridian", p.lon0)]
+        }
+        "eqearth" -> {
+            name = "Equal_Earth"
+            params = [("central_meridian", p.lon0)]
+        }
+        "labrd" -> {
+            name = "Laborde_Oblique_Mercator"
+            params = [("latitude_of_center", p.lat0), ("longitude_of_center", p.lon0), ("azimuth", p.azi), ("scale_factor", p.k0)]
+        }
+        "nzmg" -> {
+            name = "New_Zealand_Map_Grid"
+            params = [("latitude_of_origin", p.lat0), ("central_meridian", p.lon0)]
+        }
         _ -> {}
     }
     var parts: [String] = ["PROJCS[\"{c.name}\"", geog, "PROJECTION[\"{name}\"]"]
     for (n, v) in params {
-        let shown = if n == "scale_factor" { v } else { v / c.angleUnit }
+        let shown = if n == "scale_factor" || n == "height" || n == "auxiliary_sphere_type" { v } else { v / c.angleUnit }
         parts.append("PARAMETER[\"{n}\",{wktNumber(shown)}]")
     }
     parts.append("PARAMETER[\"false_easting\",{wktNumber(p.x0 / c.toMeter)}]")
     parts.append("PARAMETER[\"false_northing\",{wktNumber(p.y0 / c.toMeter)}]")
     let unitLabel = if c.toMeter == 1.0 { "metre" } else if c.toMeter == 0.3048 { "foot" } else if abs(c.toMeter - 1200.0 / 3937.0) < 1e-15 { "US survey foot" } else { "unit" }
     parts.append("UNIT[\"{unitLabel}\",{c.toMeter}]")
-    let xd = if c.axis.hasPrefix("w") { "WEST" } else { "EAST" }
-    let yd = if c.axis.character(at: 1) == "s" { "SOUTH" } else { "NORTH" }
+    // Krovak's +czech turns both axes round.
+    let (sx0, sy0) = axisSigns(c.axis)
+    let flip = if p.czech { -1.0 } else { 1.0 }
+    let xd = if sx0 * flip < 0.0 { "WEST" } else { "EAST" }
+    let yd = if sy0 * flip < 0.0 { "SOUTH" } else { "NORTH" }
     parts.append("AXIS[\"Easting\",{xd}]")
     parts.append("AXIS[\"Northing\",{yd}]")
     if c.code != 0 {
