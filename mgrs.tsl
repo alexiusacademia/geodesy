@@ -1,0 +1,159 @@
+// geodesy: MGRS, the Military Grid Reference System: a UTM (or polar UPS)
+// position written as zone, latitude band, 100 km square and digits, like
+// "51PTS8284814992" (a 1 m square in Manila). Fewer digits name larger
+// squares: 3 pairs is 100 m, none the whole 100 km square. On WGS84.
+//
+// Author: Alexius Academia
+// Date: 2026-10-31
+
+let bandLetters = "CDEFGHJKLMNPQRSTUVWX"
+let utmColumns = ["ABCDEFGH", "JKLMNPQR", "STUVWXYZ"]
+let utmRows = "ABCDEFGHJKLMNPQRSTUV"
+let upsColumns = ["JKLPQRSTUXYZ", "ABCFGHJKLPQR", "RSTUXYZ", "ABCFGHJ"]
+let upsRows = ["ABCDEFGHJKLMNPQRSTUVWXYZ", "ABCDEFGHJKLMNP"]
+
+fn letterAt(_ s: String, _ k: Int) -> String {
+    s.character(at: k) ?? "?"
+}
+
+fn indexIn(_ s: String, _ ch: String) -> Int {
+    s.find(ch) ?? -1
+}
+
+fn upsCrs(_ north: Bool) -> Crs {
+    epsg(if north { 32661 } else { 32761 }) ?? wgs84Crs()
+}
+
+// The digits of a coordinate within its 100 km square, truncated to
+// `precision` digits.
+fn mgrsDigits(_ v: Float, _ precision: Int) -> String {
+    if precision == 0 {
+        return ""
+    }
+    let within = v - floor(v / 100000.0) * 100000.0
+    let d = Int(floor(within / pow(10.0, Float(5 - precision)) + 1e-9))
+    "{d}".padStart(precision, with: "0")
+}
+
+// toMGRS(lat, lon, precision:)
+//   The MGRS reference of a WGS84 point, with `precision` digits for each
+//   of easting and northing (5: 1 m; 4: 10 m; … 0: the 100 km square).
+//
+//   print(geodesy.toMGRS(14.5995, 120.9842))     // 51PTS8284814992
+public fn toMGRS(_ lat: Float, _ lon: Float, precision: Int = 5) -> String {
+    checkLatLon("toMGRS", lat, lon)
+    let p = max(0, min(5, precision))
+    if lat < -80.0 || lat >= 84.0 {
+        let north = lat >= 84.0
+        let (e, n) = upsCrs(north).fromWGS84(lon, lat)
+        let xh = Int(floor(e / 100000.0))
+        let yh = Int(floor(n / 100000.0))
+        let east = e >= 2000000.0
+        let band = (if north { 2 } else { 0 }) + (if east { 1 } else { 0 })
+        let colBase = if east { 20 } else { if north { 13 } else { 8 } }
+        let rowBase = if north { 13 } else { 8 }
+        let zoneLetter = letterAt("ABYZ", band)
+        let col = letterAt(upsColumns[band], xh - colBase)
+        let row = letterAt(upsRows[if north { 1 } else { 0 }], yh - rowBase)
+        return zoneLetter + col + row + mgrsDigits(e, p) + mgrsDigits(n, p)
+    }
+    let zone = utmZone(lat, lon)
+    let (e, n) = utm(zone: zone, south: lat < 0.0).fromWGS84(lon, lat)
+    let bandIndex = min(19, Int(floor((lat + 80.0) / 8.0)))
+    let band = letterAt(bandLetters, bandIndex)
+    let xh = Int(floor(e / 100000.0))
+    let yh = Int(floor(n / 100000.0))
+    let col = letterAt(utmColumns[(zone - 1) % 3], xh - 1)
+    let row = letterAt(utmRows, (yh + (if (zone - 1) % 2 == 1 { 5 } else { 0 })) % 20)
+    let z = if zone < 10 { "0{zone}" } else { "{zone}" }
+    z + band + col + row + mgrsDigits(e, p) + mgrsDigits(n, p)
+}
+
+// fromMGRS(text, center:)
+//   The WGS84 (latitude, longitude) of an MGRS reference: the south-west
+//   corner of its square, or its middle with `center: true`. Spaces are
+//   allowed ("51P TS 82848 14992"). A failure says what's wrong.
+public fn fromMGRS(_ text: String, center: Bool = false) -> Result<(Float, Float)> {
+    let t = text.replace(" ", with: "").uppercase()
+    let chars = t.characters
+    var k = 0
+    var zoneText = ""
+    while k < chars.count && k < 2 && isDigitChar(chars[k]) {
+        zoneText += chars[k]
+        k += 1
+    }
+    if chars.count - k < 3 {
+        return Result.failure(error: Error("\"{text}\" is too short for MGRS"))
+    }
+    let bandCh = chars[k]
+    let colCh = chars[k + 1]
+    let rowCh = chars[k + 2]
+    let digits = t.substring(from: k + 3, to: t.count)
+    if digits.count % 2 != 0 || digits.count > 10 {
+        return Result.failure(error: Error("an MGRS reference needs the same number of easting and northing digits"))
+    }
+    for d in digits.characters {
+        if !isDigitChar(d) {
+            return Result.failure(error: Error("\"{d}\" can't be in MGRS digits"))
+        }
+    }
+    let p = digits.count / 2
+    let unit = pow(10.0, Float(5 - p))
+    let de = if p > 0 { (Float(digits.substring(from: 0, to: p)) ?? 0.0) * unit } else { 0.0 }
+    let dn = if p > 0 { (Float(digits.substring(from: p, to: digits.count)) ?? 0.0) * unit } else { 0.0 }
+    let half = if center { unit / 2.0 } else { 0.0 }
+    if zoneText.isEmpty {
+        // UPS: A, B (south), Y, Z (north).
+        let band = indexIn("ABYZ", bandCh)
+        if band < 0 {
+            return Result.failure(error: Error("\"{bandCh}\" isn't a polar MGRS zone (A, B, Y or Z)"))
+        }
+        let north = band >= 2
+        let east = band % 2 == 1
+        let ci = indexIn(upsColumns[band], colCh)
+        let ri = indexIn(upsRows[if north { 1 } else { 0 }], rowCh)
+        if ci < 0 || ri < 0 {
+            return Result.failure(error: Error("\"{colCh}{rowCh}\" isn't a 100 km square of zone {bandCh}"))
+        }
+        let colBase = if east { 20 } else { if north { 13 } else { 8 } }
+        let rowBase = if north { 13 } else { 8 }
+        let e = Float(ci + colBase) * 100000.0 + de + half
+        let n = Float(ri + rowBase) * 100000.0 + dn + half
+        let (lon, lat) = upsCrs(north).toWGS84(e, n)
+        return Result.ok(value: (lat, lon))
+    }
+    let zone = Int(zoneText) ?? 0
+    if zone < 1 || zone > 60 {
+        return Result.failure(error: Error("the zone must be from 1 to 60, not {zoneText}"))
+    }
+    let bi = indexIn(bandLetters, bandCh)
+    if bi < 0 {
+        return Result.failure(error: Error("\"{bandCh}\" isn't a latitude band (C to X, without I and O)"))
+    }
+    let ci = indexIn(utmColumns[(zone - 1) % 3], colCh)
+    var ri = indexIn(utmRows, rowCh)
+    if ci < 0 || ri < 0 {
+        return Result.failure(error: Error("\"{colCh}{rowCh}\" isn't a 100 km square of zone {zone}"))
+    }
+    if (zone - 1) % 2 == 1 {
+        ri = (ri - 5 + 20) % 20
+    }
+    let south = bi < 10
+    let crs = utm(zone: zone, south: south)
+    let e = Float(ci + 1) * 100000.0 + de + half
+    // The northing: the 100 km row repeats every 2000 km, so take the
+    // repeat that falls in the latitude band.
+    let bandLat = -80.0 + 8.0 * Float(bi)
+    let lon0 = Float(zone * 6 - 183)
+    let (_, bandNorth) = crs.fromWGS84(lon0, bandLat)
+    let rowNorth = Float(ri) * 100000.0
+    var n = rowNorth + 2000000.0 * floor((bandNorth - rowNorth) / 2000000.0)
+    while n + 100000.0 < bandNorth - 1.0 {
+        n += 2000000.0
+    }
+    if n - bandNorth > 1900000.0 {
+        n -= 2000000.0
+    }
+    let (lon, lat) = crs.toWGS84(e, n + dn + half)
+    Result.ok(value: (lat, lon))
+}

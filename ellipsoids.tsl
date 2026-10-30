@@ -1,0 +1,10 @@
+// geodesy: named ellipsoids.
+//
+// Author: Alexius Academia
+// Date: 2026-10-31
+
+// wgs84()
+//   The WGS84 ellipsoid of GPS: a = 6 378 137 m, f = 1 / 298.257223563.
+public fn wgs84() -> Ellipsoid {
+    ellipsoid(a: 6378137.0, f: 1.0 / 298.257223563, name: "WGS84")
+}

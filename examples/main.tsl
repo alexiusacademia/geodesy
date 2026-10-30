@@ -1,0 +1,98 @@
+// geodesy's examples: the README's pictures, drawn with the chart library.
+// `tessel run examples` from the library's folder saves them in docs/:
+//   route.png  Manila to Los Angeles on a Mercator map: the geodesic and
+//              the rhumb line
+//   scale.png  the grid scale factor across the UTM and PRS92 zones at
+//              Manila's latitude
+//
+// Author: Alexius Academia
+// Date: 2026-10-31
+
+import ".."
+import chart
+
+fn route() {
+    let mercator = geodesy.epsg(3857) ?? geodesy.wgs84Crs()
+    let (mla, mlo) = (14.5995, 120.9842)
+    let (lla, llo) = (34.0522, -118.2437 + 360.0)
+    let line = geodesy.lineBetween(mla, mlo, lla, llo)
+    let (glat, glon) = line.points(200)
+    let (rlat, rlon) = geodesy.rhumbPoints(mla, mlo, lla, llo, count: 200)
+    let (rs, _) = geodesy.rhumb(mla, mlo, lla, llo)
+    // On Web Mercator, in thousands of km, longitudes run on past 180°.
+    var gx: [Float] = []
+    var gy: [Float] = []
+    for k in 0..glat.count {
+        let lon = if glon[k] < 0.0 { glon[k] + 360.0 } else { glon[k] }
+        let (x, y) = mercator.fromWGS84(lon - 360.0 * (if lon > 180.0 { 1.0 } else { 0.0 }), glat[k])
+        gx.append((x + (if lon > 180.0 { 2.0 * 20037508.342789244 } else { 0.0 })) / 1e6)
+        gy.append(y / 1e6)
+    }
+    var rx: [Float] = []
+    var ry: [Float] = []
+    for k in 0..rlat.count {
+        let lon = if rlon[k] < 0.0 { rlon[k] + 360.0 } else { rlon[k] }
+        let (x, y) = mercator.fromWGS84(lon - 360.0 * (if lon > 180.0 { 1.0 } else { 0.0 }), rlat[k])
+        rx.append((x + (if lon > 180.0 { 2.0 * 20037508.342789244 } else { 0.0 })) / 1e6)
+        ry.append(y / 1e6)
+    }
+    var c = chart.Chart(title: "Manila to Los Angeles on a Mercator map", xLabel: "Web Mercator x (1000 km)",
+                        yLabel: "Web Mercator y (1000 km)", xMax: 30.0, equalAspect: true, legend: .bottomTrailing)
+    c.line(gx, gy, name: "geodesic: {(line.length / 1000.0).formatted(decimals: 0)} km")
+    c.line(rx, ry, name: "rhumb line: {(rs / 1000.0).formatted(decimals: 0)} km", dash: [6, 4])
+    let cities: [(String, Float, Float)] = [("Manila", mla, mlo), ("Tokyo", 35.6762, 139.6503), ("Honolulu", 21.3069, -157.8583),
+                                            ("Los Angeles", lla, llo - 360.0)]
+    for (name, lat, lon) in cities {
+        let (x, y) = mercator.fromWGS84(lon, lat)
+        let px = if lon < 0.0 { x + 2.0 * 20037508.342789244 } else { x }
+        c.point(x: px / 1e6, y: y / 1e6, label: name)
+    }
+    print(c.savePNG("docs/route.png", width: 720, height: 360))
+}
+
+fn scale() {
+    let lat = 14.6
+    var c = chart.Chart(title: "Grid scale factor at 14.6°N, across the zones", xLabel: "Longitude (°E)",
+                        yLabel: "Scale factor", legend: .bottomTrailing)
+    // UTM zones 50 to 52 (6° wide, k0 = 0.9996).
+    var first = true
+    for zone in 50..53 {
+        let crs = geodesy.utm(zone: zone)
+        let lon0 = Float(zone * 6 - 183)
+        var xs: [Float] = []
+        var ys: [Float] = []
+        var lon = max(116.0, lon0 - 3.0)
+        while lon <= min(127.0, lon0 + 3.0) + 1e-9 {
+            let (k, _, _) = crs.gridFactors(lon, lat)
+            xs.append(lon)
+            ys.append(k)
+            lon += 0.05
+        }
+        c.line(xs, ys, name: if first { "UTM zones 50–52 (6° wide)" } else { "" }, color: .blue)
+        first = false
+    }
+    // PRS92 zones I to V (2° wide, k0 = 0.99995).
+    first = true
+    for (k, code) in [3121, 3122, 3123, 3124, 3125].enumerated() {
+        let crs = geodesy.epsg(code) ?? geodesy.wgs84Crs()
+        let lon0 = 117.0 + 2.0 * Float(k)
+        var xs: [Float] = []
+        var ys: [Float] = []
+        var lon = lon0 - 1.0
+        while lon <= lon0 + 1.0 + 1e-9 {
+            let (kk, _, _) = crs.gridFactors(lon, lat)
+            xs.append(lon)
+            ys.append(kk)
+            lon += 0.02
+        }
+        c.line(xs, ys, name: if first { "PRS92 zones I–V (2° wide)" } else { "" }, color: .orange)
+        first = false
+    }
+    c.horizontalLine(1.0, label: "true scale")
+    print(c.savePNG("docs/scale.png", width: 720, height: 380))
+}
+
+fn main() {
+    route()
+    scale()
+}

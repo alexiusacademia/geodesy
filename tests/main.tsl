@@ -1,0 +1,593 @@
+// geodesy's tests. First the cases in cases.json, with the answers of
+// GeographicLib (geodesics, lines, polygons), SciPy (rhumb lines), PROJ
+// (every EPSG projection, datum shifts, systems across datums, PROJ
+// strings and WKT) and the mgrs package, made by tools/oracle/oracle.py.
+// Then the rest by hand: degrees as text, MGRS, messages and odd cases.
+// `tessel run tests` prints the failures, the largest differences, and a
+// count; it exits with 1 if any check failed.
+//
+// Author: Alexius Academia
+// Date: 2026-10-31
+
+import ".."
+
+struct GeodesicCase {
+    ellipsoid: String
+    lat1: Float
+    lon1: Float
+    lat2: Float
+    lon2: Float
+    s12: Float
+    azi1: Float
+    azi2: Float
+    a12: Float
+    m12: Float
+    M12: Float
+    M21: Float
+    S12: Float
+    dazi1: Float
+    ds12: Float
+    dlat2: Float
+    dlon2: Float
+    dazi2: Float
+}
+
+struct LineCase {
+    lat1: Float
+    lon1: Float
+    azi1: Float
+    points: [[Float]]
+}
+
+struct PolygonCase {
+    lats: [Float]
+    lons: [Float]
+    area: Float
+    perimeter: Float
+    track: Float
+}
+
+struct RhumbCase {
+    lat1: Float
+    lon1: Float
+    lat2: Float
+    lon2: Float
+    s12: Float
+    azi12: Float
+}
+
+struct PointsCase {
+    code: Int
+    points: [[Float]]
+}
+
+struct CrossCase {
+    from: Int
+    to: Int
+    points: [[Float]]
+}
+
+struct TextCase {
+    code: Int
+    texts: [[String]]
+    points: [[Float]]
+}
+
+struct MgrsCase {
+    lat: Float
+    lon: Float
+    precision: Int
+    mgrs: String
+    lat2: Float
+    lon2: Float
+}
+
+struct Cases {
+    geodesics: [GeodesicCase]
+    lines: [LineCase]
+    polygons: [PolygonCase]
+    rhumbs: [RhumbCase]
+    projections: [PointsCase]
+    datums: [PointsCase]
+    cross: [CrossCase]
+    texts: [TextCase]
+    mgrs: [MgrsCase]
+}
+
+// The checks made, the ones that failed, and the largest difference of
+// each kind.
+struct Tally {
+    failures: Int = 0
+    checks: Int = 0
+    worst: [String: Float] = [:]
+    perKind: [String: Int] = [:]
+
+    fn fail(_ what: String) {
+        failures += 1
+        let kind = what.split(" ").prefix(3).joined(separator: " ")
+        let n = (perKind[kind] ?? 0) + 1
+        perKind[kind] = n
+        if n <= 3 {
+            print("FAIL {what}")
+        }
+    }
+
+    // got and want agree within tol (NaN agrees with NaN).
+    fn check(_ kind: String, _ what: String, _ got: Float, _ want: Float, _ tol: Float) {
+        checks += 1
+        let w = if want == 1e308 { 0.0 / 0.0 } else { want }
+        if w.isNaN || got.isNaN {
+            if !(w.isNaN && got.isNaN) {
+                fail("{kind} {what}: got {got}, want {w}")
+            }
+            return
+        }
+        let d = abs(got - w)
+        if d > (worst[kind] ?? 0.0) {
+            worst[kind] = d
+        }
+        if !(d <= tol) {
+            fail("{kind} {what}: got {got}, want {w} (off by {d})")
+        }
+    }
+
+    // Two angles in degrees agree, going round at ±180.
+    fn checkAngle(_ kind: String, _ what: String, _ got: Float, _ want: Float, _ tol: Float) {
+        var d = abs(got - want)
+        d = min(d, abs(d - 360.0))
+        check(kind, what, d, 0.0, tol)
+    }
+
+    fn checkTrue(_ what: String, _ ok: Bool) {
+        checks += 1
+        if !ok {
+            fail(what)
+        }
+    }
+
+    fn checkText(_ what: String, _ got: String, _ want: String) {
+        checks += 1
+        if got != want {
+            fail("{what}: got \"{got}\", want \"{want}\"")
+        }
+    }
+}
+
+fn ellipsoidOf(_ name: String) -> geodesy.Ellipsoid {
+    match name {
+        "clrk66" -> geodesy.ellipsoid(a: 6378206.4, f: 1.0 / 294.9786982138982)
+        "sphere" -> geodesy.ellipsoid(a: 6371000.0, f: 0.0)
+        "flat" -> geodesy.ellipsoid(a: 6378137.0, f: 1.0 / 150.0)
+        "prolate" -> geodesy.ellipsoid(a: 6378137.0, f: -1.0 / 150.0)
+        _ -> geodesy.wgs84()
+    }
+}
+
+// Metres per degree of latitude, to put angle differences in metres.
+let metresPerDegree = 111320.0
+
+fn testGeodesics(_ t: bind Tally, _ cases: Cases) {
+    for (k, c) in cases.geodesics.enumerated() {
+        let g = ellipsoidOf(c.ellipsoid)
+        let what = "case {k} ({c.ellipsoid}) {c.lat1},{c.lon1} to {c.lat2},{c.lon2}"
+        let r = geodesy.inverse(c.lat1, c.lon1, c.lat2, c.lon2, on: g)
+        t.check("geodesic distance (m)", what, r.distance, c.s12, 1e-8)
+        if c.s12 > 1e-3 {
+            t.checkAngle("geodesic azimuth (°)", what + " azi1", r.azimuth1, c.azi1, 1e-9)
+            t.checkAngle("geodesic azimuth (°)", what + " azi2", r.azimuth2, c.azi2, 1e-9)
+        }
+        t.check("geodesic arc (°)", what, r.arc, c.a12, 1e-12)
+        t.check("reduced length (m)", what, r.reducedLength, c.m12, 1e-8)
+        t.check("geodesic scale", what + " M12", r.scale12, c.M12, 1e-12)
+        t.check("geodesic scale", what + " M21", r.scale21, c.M21, 1e-12)
+        t.check("area to the equator (m²)", what, r.area, c.S12, 1e-3 + 1e-12 * abs(c.S12))
+        let (lat2, lon2, azi2) = geodesy.direct(c.lat1, c.lon1, azimuth: c.dazi1, distance: c.ds12, on: g)
+        t.check("direct latitude (°)", what, lat2, c.dlat2, 1e-11)
+        t.checkAngle("direct longitude (°)", what, lon2, c.dlon2, 1e-11)
+        t.checkAngle("direct azimuth (°)", what, azi2, c.dazi2, 1e-10)
+    }
+    for (k, c) in cases.lines.enumerated() {
+        let l = geodesy.line(c.lat1, c.lon1, azimuth: c.azi1)
+        for p in c.points {
+            let (lat, lon, azi) = l.position(p[0])
+            t.check("line latitude (°)", "line {k} at {p[0]}", lat, p[1], 1e-11)
+            t.check("line longitude, unrolled (°)", "line {k} at {p[0]}", lon, p[2], 1e-10)
+            t.checkAngle("line azimuth (°)", "line {k} at {p[0]}", azi, p[3], 1e-10)
+        }
+    }
+    for (k, c) in cases.polygons.enumerated() {
+        let (area, perimeter) = geodesy.polygonArea(c.lats, c.lons)
+        t.check("polygon area (m²)", "polygon {k}", area, c.area, max(1e-2, 1e-11 * abs(c.area)))
+        t.check("polygon perimeter (m)", "polygon {k}", perimeter, c.perimeter, 1e-6)
+        t.check("track length (m)", "polygon {k}", geodesy.trackLength(c.lats, c.lons), c.track, 1e-6)
+    }
+    for (k, c) in cases.rhumbs.enumerated() {
+        let (s, azi) = geodesy.rhumb(c.lat1, c.lon1, c.lat2, c.lon2)
+        t.check("rhumb distance (m)", "rhumb {k}", s, c.s12, max(1e-6, 1e-12 * c.s12))
+        t.checkAngle("rhumb azimuth (°)", "rhumb {k}", azi, c.azi12, 1e-10)
+        let (lat, lon) = geodesy.rhumbDirect(c.lat1, c.lon1, azimuth: azi, distance: s)
+        t.check("rhumb back (°)", "rhumb {k} latitude", lat, c.lat2, 1e-9)
+        t.checkAngle("rhumb back (°)", "rhumb {k} longitude", lon, c.lon2, 1e-9)
+    }
+}
+
+fn testProjections(_ t: bind Tally, _ cases: Cases) {
+    for c in cases.projections {
+        if let crs = geodesy.epsg(c.code) {
+            let kind = crs.projection.method
+            for p in c.points {
+                let (x, y) = crs.fromLonLat(p[0], p[1])
+                let scale = crs.toMeter
+                t.check("{kind} forward (m)", "EPSG:{c.code} at {p[0]},{p[1]}", x * scale, p[2] * scale, 1e-6)
+                t.check("{kind} forward (m)", "EPSG:{c.code} at {p[0]},{p[1]}", y * scale, p[3] * scale, 1e-6)
+                let (lon, lat) = crs.toLonLat(p[2], p[3])
+                t.checkAngle("{kind} inverse (°)", "EPSG:{c.code} at {p[2]},{p[3]}", lon, p[0], 1e-9)
+                t.check("{kind} inverse (°)", "EPSG:{c.code} at {p[2]},{p[3]}", lat, p[1], 1e-9)
+            }
+        } else {
+            t.checkTrue("EPSG:{c.code} is in the table", false)
+        }
+    }
+    for c in cases.datums {
+        if let crs = geodesy.epsg(c.code) {
+            for p in c.points {
+                // From the system's own (lon, lat) in degrees from Greenwich.
+                let (x, y) = crs.fromLonLat(p[0], p[1])
+                let (lon, lat) = crs.toWGS84(x, y)
+                t.checkAngle("datum shift (°)", "EPSG:{c.code} at {p[0]},{p[1]}", lon, p[2], 1e-9)
+                t.check("datum shift (°)", "EPSG:{c.code} at {p[0]},{p[1]}", lat, p[3], 1e-9)
+                if p[4] != 1e308 {
+                    t.checkAngle("PROJ's own EPSG shift (°)", "EPSG:{c.code} at {p[0]},{p[1]}", lon, p[4], 1e-8)
+                    t.check("PROJ's own EPSG shift (°)", "EPSG:{c.code} at {p[0]},{p[1]}", lat, p[5], 1e-8)
+                }
+                let (bx, by) = crs.fromWGS84(lon, lat)
+                // A 2-D shift there and back drops the height each way, so
+                // it returns only to within centimetres (PROJ's own does the
+                // same: 6e-7° for EPSG:4657).
+                t.check("datum shift and back", "EPSG:{c.code}", bx, x, 5e-6)
+                t.check("datum shift and back", "EPSG:{c.code}", by, y, 5e-6)
+            }
+        }
+    }
+    for c in cases.cross {
+        let a = geodesy.epsg(c.from) ?? geodesy.wgs84Crs()
+        let b = geodesy.epsg(c.to) ?? geodesy.wgs84Crs()
+        for p in c.points {
+            let (u, v) = geodesy.transform(p[0], p[1], from: a, to: b)
+            // Five steps (projection, two Helmerts, projection) on large
+            // coordinates: PROJ and geodesy agree to a millimetre.
+            let tol = if b.isGeographic() { 1e-8 } else { 1e-3 / b.toMeter }
+            t.check("across datums", "EPSG:{c.from} to EPSG:{c.to}", u, p[2], tol)
+            t.check("across datums", "EPSG:{c.from} to EPSG:{c.to}", v, p[3], tol)
+        }
+    }
+    for c in cases.texts {
+        for pair in c.texts {
+            let kind = pair[0]
+            match geodesy.crs(pair[1]) {
+                .ok(crs) -> {
+                    for p in c.points {
+                        let (x, y) = crs.fromLonLat(p[0], p[1])
+                        let s = crs.toMeter
+                        t.check("read from {kind} (m)", "EPSG:{c.code}", x * s, p[2] * s, 1e-6)
+                        t.check("read from {kind} (m)", "EPSG:{c.code}", y * s, p[3] * s, 1e-6)
+                    }
+                    // What geodesy writes, it reads back the same.
+                    match geodesy.fromWkt(crs.wkt()) {
+                        .ok(back) -> {
+                            let p = c.points[0]
+                            let (x, y) = back.fromLonLat(p[0], p[1])
+                            t.check("WKT written and read back (m)", "EPSG:{c.code}", x * back.toMeter, p[2] * crs.toMeter, 1e-6)
+                            t.check("WKT written and read back (m)", "EPSG:{c.code}", y * back.toMeter, p[3] * crs.toMeter, 1e-6)
+                        }
+                        .failure(e) -> t.checkTrue("EPSG:{c.code} WKT written and read back: {e.message}", false)
+                    }
+                    match geodesy.fromProj(crs.proj()) {
+                        .ok(back) -> {
+                            let p = c.points[0]
+                            let (x, y) = back.fromLonLat(p[0], p[1])
+                            t.check("PROJ string written and read back (m)", "EPSG:{c.code}", x * back.toMeter, p[2] * crs.toMeter, 1e-6)
+                            t.check("PROJ string written and read back (m)", "EPSG:{c.code}", y * back.toMeter, p[3] * crs.toMeter, 1e-6)
+                        }
+                        .failure(e) -> t.checkTrue("EPSG:{c.code} PROJ string written and read back: {e.message}", false)
+                    }
+                }
+                .failure(e) -> t.checkTrue("EPSG:{c.code} from {kind}: {e.message}", false)
+            }
+        }
+    }
+}
+
+fn testMgrs(_ t: bind Tally, _ cases: Cases) {
+    var lastDigit = 0
+    for c in cases.mgrs {
+        let s = geodesy.toMGRS(c.lat, c.lon, precision: c.precision)
+        t.checks += 1
+        if s != c.mgrs {
+            // The last digit can differ where a point is within a hair of a
+            // square's edge: both must then name neighbouring squares.
+            let a = geodesy.fromMGRS(s).valueOr((1000.0, 0.0))
+            let b = geodesy.fromMGRS(c.mgrs).valueOr((-1000.0, 0.0))
+            let (la, lo) = a
+            let (lb, lob) = b
+            let step = pow(10.0, Float(5 - c.precision))
+            let apart = geodesy.distance(la, lo, lb, lob)
+            if apart > step * 1.5 || s.count != c.mgrs.count {
+                t.fail("MGRS of {c.lat},{c.lon}: {s}, mgrs has {c.mgrs}")
+            } else {
+                lastDigit += 1
+            }
+        }
+        match geodesy.fromMGRS(c.mgrs) {
+            .ok(pos) -> {
+                let (lat, lon) = pos
+                t.check("MGRS read (°)", c.mgrs, lat, c.lat2, 1e-6)
+                t.checkAngle("MGRS read (°)", c.mgrs, lon, c.lon2, 1e-6)
+            }
+            .failure(e) -> t.checkTrue("MGRS {c.mgrs}: {e.message}", false)
+        }
+    }
+    t.checkTrue("MGRS: few last-digit differences ({lastDigit})", lastDigit * 50 <= cases.mgrs.count)
+}
+
+fn testCases(_ t: bind Tally) {
+    let text = readFile("tests/cases.json") ?? ""
+    let loaded: Cases? = fromJson(text)
+    if loaded == nil {
+        t.fail("tests/cases.json can't be read: run from the library's folder")
+        return
+    }
+    let cases = loaded ?? Cases(geodesics: [], lines: [], polygons: [], rhumbs: [], projections: [],
+                                datums: [], cross: [], texts: [], mgrs: [])
+    testGeodesics(t, cases)
+    testProjections(t, cases)
+    testMgrs(t, cases)
+}
+
+// Angles and positions as text.
+fn testText(_ t: bind Tally) {
+    let angles: [(String, Float)] = [("14.5995", 14.5995), ("-121.5", -121.5), ("14°35'45.2\"N", 14.0 + 35.0 / 60.0 + 45.2 / 3600.0),
+        ("14 35 45.2 S", -(14.0 + 35.0 / 60.0 + 45.2 / 3600.0)), ("N14°35.753'", 14.0 + 35.753 / 60.0),
+        ("121:30:00E", 121.5), ("121d30m15s W", -(121.0 + 30.0 / 60.0 + 15.0 / 3600.0)), ("40d30'N", 40.5),
+        ("W 121.5", -121.5), ("121.5w", -121.5), ("14°35′45.2″", 14.0 + 35.0 / 60.0 + 45.2 / 3600.0), ("−7.25", -7.25),
+        ("45,5", 45.5), ("+12", 12.0), ("0", 0.0), ("S 0 30", -0.5)]
+    for (text, want) in angles {
+        match geodesy.readAngle(text) {
+            .ok(v) -> t.check("readAngle", text, v, want, 1e-12)
+            .failure(e) -> t.checkTrue("readAngle \"{text}\": {e.message}", false)
+        }
+    }
+    for bad in ["", "abc", "12°°", "1 2 3 4", "12 61", "12°30'75\""] {
+        t.checkTrue("readAngle refuses \"{bad}\"", !geodesy.readAngle(bad).isOk())
+    }
+    let positions: [(String, Float, Float)] = [("14.5995, 120.9842", 14.5995, 120.9842),
+        ("14°35'58.2\"N 120°59'03.1\"E", 14.0 + 35.0 / 60.0 + 58.2 / 3600.0, 120.0 + 59.0 / 60.0 + 3.1 / 3600.0),
+        ("N14 35 58.2 E120 59 03.1", 14.0 + 35.0 / 60.0 + 58.2 / 3600.0, 120.0 + 59.0 / 60.0 + 3.1 / 3600.0),
+        ("120.9842E 14.5995N", 14.5995, 120.9842), ("-33.86 151.2", -33.86, 151.2),
+        ("33°51.6'S, 151°12'E", -33.86, 151.2)]
+    for (text, lat, lon) in positions {
+        match geodesy.readLatLon(text) {
+            .ok(p) -> {
+                let (a, b) = p
+                t.check("readLatLon", text, a, lat, 1e-12)
+                t.check("readLatLon", text, b, lon, 1e-12)
+            }
+            .failure(e) -> t.checkTrue("readLatLon \"{text}\": {e.message}", false)
+        }
+    }
+    t.checkTrue("readLatLon refuses a latitude past 90", !geodesy.readLatLon("95, 10").isOk())
+    t.checkText("formatAngle DMS", geodesy.formatAngle(14.5995, decimals: 2, hemispheres: "NS"), "14°35'58.20\"N")
+    t.checkText("formatAngle DM", geodesy.formatAngle(-121.5, style: .degreesMinutes, decimals: 3, hemispheres: "EW"), "121°30.000'W")
+    t.checkText("formatAngle decimal", geodesy.formatAngle(-7.25, style: .decimal, decimals: 4), "-7.2500°")
+    t.checkText("formatAngle carries 59.999\"", geodesy.formatAngle(10.0 + 59.0 / 60.0 + 59.9999 / 3600.0, decimals: 2), "11°00'00.00\"")
+    t.checkText("formatAngle carries minutes", geodesy.formatAngle(9.99999999, style: .degreesMinutes, decimals: 2), "10°00.00'")
+    t.checkText("formatLatLon", geodesy.formatLatLon(14.5995, 120.9842), "14°35'58.20\"N 120°59'03.12\"E")
+    t.checkText("formatLatLon south west", geodesy.formatLatLon(-33.86, -151.2, decimals: 0), "33°51'36\"S 151°12'00\"W")
+    // What formatLatLon writes, readLatLon reads back.
+    for (lat, lon) in [(14.5995, 120.9842), (-33.8688, 151.2093), (51.4779, -0.0015), (-0.0001, 0.0001)] {
+        let text = geodesy.formatLatLon(lat, lon, decimals: 4)
+        let (a, b) = geodesy.readLatLon(text).valueOr((99.0, 0.0))
+        t.check("read back", text, a, lat, 1e-7)
+        t.check("read back", text, b, lon, 1e-7)
+    }
+}
+
+// Systems, zones and the Philippines.
+fn testSystems(_ t: bind Tally) {
+    let wgs = geodesy.wgs84Crs()
+    // Rizal Park, Manila, against PROJ.
+    let (e3, n3) = geodesy.transform(120.97695, 14.58285, from: wgs, to: geodesy.epsg(3123) ?? wgs)
+    t.check("PRS92 zone 3", "easting", e3, 497369.80738421954, 1e-6)
+    t.check("PRS92 zone 3", "northing", n3, 1612820.041793808, 1e-6)
+    let (el, nl) = geodesy.transform(120.97695, 14.58285, from: wgs, to: geodesy.epsg(25393) ?? wgs)
+    t.check("Luzon 1911 zone III", "easting", el, 497362.67313002225, 1e-6)
+    t.check("Luzon 1911 zone III", "northing", nl, 1612819.167709399, 1e-6)
+    let (eu, nu) = geodesy.transform(120.97695, 14.58285, from: wgs, to: geodesy.utm(zone: 51))
+    t.check("UTM 51N", "easting", eu, 282051.2972745599, 1e-6)
+    t.check("UTM 51N", "northing", nu, 1613157.271318003, 1e-6)
+    let (ew, nw) = geodesy.transform(120.97695, 14.58285, from: wgs, to: geodesy.epsg(3857) ?? wgs)
+    t.check("Web Mercator", "x", ew, 13467092.471723318, 1e-6)
+    t.check("Web Mercator", "y", nw, 1641171.5054665667, 1e-6)
+    // Within one datum: no shift (zone 3 to PRS92 latitude and longitude).
+    let (lo, la) = geodesy.transform(500000.0, 1600000.0, from: geodesy.epsg(3123) ?? wgs, to: geodesy.epsg(4683) ?? wgs)
+    t.check("PRS92 zone 3 to PRS92", "longitude", lo, 121.0, 1e-12)
+    t.check("PRS92 zone 3 to PRS92", "latitude", la, 14.468476024546515, 1e-11)
+    // Many points at once.
+    let (xs, ys) = geodesy.transformAll([120.97695, 121.0], [14.58285, 14.5], from: wgs, to: geodesy.utm(zone: 51))
+    t.check("transformAll", "first", xs[0], 282051.2972745599, 1e-6)
+    t.checkTrue("transformAll counts", xs.count == 2 && ys.count == 2)
+    // UTM zones, with Norway's and Svalbard's.
+    let zones: [(Float, Float, Int)] = [(14.6, 121.0, 51), (0.0, -180.0, 1), (0.0, 179.99, 60), (60.0, 5.0, 32),
+        (60.0, 2.0, 31), (78.0, 8.0, 31), (78.0, 10.0, 33), (78.0, 25.0, 35), (78.0, 40.0, 37), (-33.9, 151.2, 56)]
+    for (lat, lon, z) in zones {
+        t.checkTrue("utmZone {lat},{lon} = {z} (got {geodesy.utmZone(lat, lon)})", geodesy.utmZone(lat, lon) == z)
+    }
+    t.checkTrue("utmFor south", geodesy.utmFor(-33.9, 151.2).code == 32756)
+    t.checkTrue("utm(zone: 51) is EPSG:32651", geodesy.utm(zone: 51).code == 32651)
+    // Codes, names and searches.
+    let ph = geodesy.epsgCodes(search: "philippines zone")
+    t.checkTrue("epsgCodes finds the PRS92 and Luzon zones ({ph.count})", ph.count >= 10)
+    t.checkTrue("epsg of an unknown code is nil", geodesy.epsg(99999) == nil)
+    t.checkTrue("crs(EPSG:3123)", geodesy.crs("EPSG:3123").isOk() && geodesy.crs("epsg: 4326").isOk())
+    t.checkTrue("crs of an unknown code fails", !geodesy.crs("EPSG:99999").isOk())
+    t.checkTrue("Hotine oblique Mercator isn't there (yet)", geodesy.epsg(3375) == nil)
+    t.checkTrue("ellipsoidNamed clrk66", (geodesy.ellipsoidNamed("clrk66")?.a ?? 0.0) == 6378206.4)
+    t.checkTrue("ellipsoidNamed of junk", geodesy.ellipsoidNamed("frob") == nil)
+    t.checkTrue("ellipsoidNames", geodesy.ellipsoidNames().contains("GRS80"))
+    // PROJ strings.
+    let ok = geodesy.fromProj("+proj=tmerc +lat_0=0 +lon_0=121 +k=0.99995 +x_0=500000 +y_0=0 +ellps=clrk66 +towgs84=-127.62,-67.24,-47.04,-3.068,4.903,1.578,-1.06 +units=m +no_defs")
+    match ok {
+        .ok(c) -> {
+            let (x, y) = c.fromWGS84(120.97695, 14.58285)
+            t.check("PROJ string PRS92 zone 3", "easting", x, 497369.80738421954, 1e-6)
+            t.check("PROJ string PRS92 zone 3", "northing", y, 1612820.041793808, 1e-6)
+        }
+        .failure(e) -> t.checkTrue("PROJ string: {e.message}", false)
+    }
+    t.checkTrue("+init=epsg:3123", geodesy.fromProj("+init=epsg:3123").isOk())
+    t.checkTrue("+proj=utm +zone=51 +south", (geodesy.fromProj("+proj=utm +zone=51 +south +datum=WGS84").value()?.projection.y0 ?? 0.0) == 10000000.0)
+    t.checkTrue("PROJ: an ellipsoid without a shift isn't known", !(geodesy.fromProj("+proj=longlat +ellps=clrk66").value()?.shiftKnown ?? true))
+    let errors: [(String, String)] = [("+proj=frob", "doesn't have the projection"), ("+proj=tmerc +ellps=frob", "isn't an ellipsoid"),
+        ("+proj=utm", "+zone"), ("+proj=tmerc +units=frob", "isn't a unit"), ("+proj=longlat +towgs84=1,2", "3 or 7"),
+        ("+lat_0=5", "no +proj")]
+    for (text, words) in errors {
+        match geodesy.fromProj(text) {
+            .ok(_) -> t.checkTrue("fromProj refuses \"{text}\"", false)
+            .failure(e) -> t.checkTrue("fromProj \"{text}\" says \"{words}\" ({e.message})", e.message.contains(words))
+        }
+    }
+    // WKT.
+    let prj = "PROJCS[\"PRS_1992_Philippines_Zone_III\",GEOGCS[\"GCS_PRS_1992\",DATUM[\"D_Philippine_Reference_System_1992\",SPHEROID[\"Clarke_1866\",6378206.4,294.9786982]],PRIMEM[\"Greenwich\",0.0],UNIT[\"Degree\",0.0174532925199433]],PROJECTION[\"Transverse_Mercator\"],PARAMETER[\"False_Easting\",500000.0],PARAMETER[\"False_Northing\",0.0],PARAMETER[\"Central_Meridian\",121.0],PARAMETER[\"Scale_Factor\",0.99995],PARAMETER[\"Latitude_Of_Origin\",0.0],UNIT[\"Meter\",1.0]]"
+    match geodesy.fromWkt(prj) {
+        .ok(c) -> {
+            t.checkTrue("an Esri .prj finds PRS92's shift by its datum's name", c.shift.count == 7 && c.shiftKnown)
+            let (x, y) = c.fromWGS84(120.97695, 14.58285)
+            t.check("Esri .prj PRS92 zone 3", "easting", x, 497369.80738421954, 1e-3)
+            t.check("Esri .prj PRS92 zone 3", "northing", y, 1612820.041793808, 1e-3)
+        }
+        .failure(e) -> t.checkTrue("Esri .prj: {e.message}", false)
+    }
+    t.checkTrue("WKT of a geographic system reads back", geodesy.fromWkt(wgs.wkt()).isOk())
+    for (text, words) in [("PROJCS[\"x\"", "ends inside"), ("FROB[\"x\"]", "can't use"), ("hello", "isn't WKT")] {
+        match geodesy.fromWkt(text) {
+            .ok(_) -> t.checkTrue("fromWkt refuses \"{text}\"", false)
+            .failure(e) -> t.checkTrue("fromWkt \"{text}\" says \"{words}\" ({e.message})", e.message.contains(words))
+        }
+    }
+}
+
+// Grid scale factors and convergence against PROJ's get_factors.
+fn testFactors(_ t: bind Tally) {
+    let cases: [(Int, Float, Float, Float, Float, Float)] = [
+        (32651, 122.5, 14.6, 0.9996358695502916, 0.9996358694688916, -0.12603773227968842),
+        (3123, 122.4, 14.6, 1.0002313897650739, 1.0002313896809705, 0.352964150949857),
+        (2154, 6.0, 46.0, 0.9990918233556376, 0.9990918233595575, 2.176823295157122),
+        (3031, 30.0, -75.0, 0.9896255444586114, 0.989625544505991, -30.00000000000644),
+        (27700, -4.0, 55.0, 0.9998020447338565, 0.9998020446915754, -1.6385244529159957),
+        (3857, 121.0, 14.6, 1.0333683202801147, 1.0333683202655788, 0.0)]
+    for (code, lon, lat, h, k, conv) in cases {
+        let c = geodesy.epsg(code) ?? geodesy.wgs84Crs()
+        let (mh, mk, mc) = c.gridFactors(lon, lat)
+        t.check("grid scale", "EPSG:{code} meridian", mh, h, 1e-8)
+        t.check("grid scale", "EPSG:{code} parallel", mk, k, 1e-8)
+        t.checkAngle("grid convergence (°)", "EPSG:{code}", mc, conv, 1e-7)
+    }
+}
+
+// Geodesics, rhumbs and MGRS by hand.
+fn testByHand(_ t: bind Tally) {
+    // Manila to Cebu (GeographicLib: 569 218.2057 m).
+    t.check("Manila to Cebu", "distance", geodesy.distance(14.5995, 120.9842, 10.3157, 123.8854), 569218.2057332923, 1e-6)
+    let l = geodesy.lineBetween(14.5995, 120.9842, 10.3157, 123.8854)
+    let (lats, lons) = l.points(5)
+    t.checkTrue("points along a line: 5, ends included", lats.count == 5 && abs(lats[4] - 10.3157) < 1e-9 && abs(lons[4] - 123.8854) < 1e-9)
+    t.check("line length", "Manila to Cebu", l.length, 569218.2057332923, 1e-6)
+    // A square kilometre lot near the equator, either way round.
+    let d = 1000.0 / 111319.49
+    let (area, perim) = geodesy.polygonArea([0, 0, d, d], [0, d, d, 0])
+    t.checkTrue("a 1 km square counterclockwise is positive ({area})", area > 0.0 && abs(area - 1.0e6) < 1.0e4)
+    let (back, _) = geodesy.polygonArea([0, d, d, 0], [0, 0, d, d])
+    t.check("clockwise is negative", "area", back, -area, 1e-6)
+    t.checkTrue("perimeter about 4 km", abs(perim - 4000.0) < 40.0)
+    // Round the north pole: about the area of the cap.
+    let (cap, _) = geodesy.polygonArea([89, 89, 89, 89], [0, 90, 180, -90])
+    t.checkTrue("round the pole: the cap above 89° ({cap})", abs(cap) > 1e9)
+    t.checkTrue("trackLength of one point", geodesy.trackLength([1], [2]) == 0.0)
+    // Rhumb lines.
+    let (rs, raz) = geodesy.rhumb(0.0, 0.0, 0.0, 90.0)
+    t.check("rhumb along the equator", "distance", rs, 6378137.0 * pi / 2.0, 1e-6)
+    t.check("rhumb along the equator", "azimuth", raz, 90.0, 1e-12)
+    let (ps, paz) = geodesy.rhumb(10.0, 20.0, 90.0, 20.0)
+    t.checkTrue("rhumb to the pole heads north", paz == 0.0 && ps > 8.8e6)
+    let (nlat, _) = geodesy.rhumbDirect(80.0, 0.0, azimuth: 10.0, distance: 3000000.0)
+    t.checkTrue("rhumbDirect past the pole is NaN", nlat.isNaN)
+    let (rl, rlo) = geodesy.rhumbPoints(14.5995, 120.9842, 35.6762, 139.6503, count: 3)
+    t.checkTrue("rhumbPoints ends", abs(rl[2] - 35.6762) < 1e-9 && abs(rlo[2] - 139.6503) < 1e-9)
+    // The rhumb is longer than the geodesic.
+    t.checkTrue("rhumb ≥ geodesic", geodesy.rhumb(14.5995, 120.9842, 35.6762, 139.6503).0 >= geodesy.distance(14.5995, 120.9842, 35.6762, 139.6503))
+    // MGRS.
+    t.checkText("MGRS Manila", geodesy.toMGRS(14.5995, 120.9842), "51PTS8284814992")
+    t.checkText("MGRS 100 m", geodesy.toMGRS(14.5995, 120.9842, precision: 3), "51PTS828149")
+    t.checkText("MGRS square", geodesy.toMGRS(14.5995, 120.9842, precision: 0), "51PTS")
+    t.checkText("MGRS zone padded", geodesy.toMGRS(21.3, -157.9), "04QFJ1409655747")
+    t.checkText("MGRS Norway", geodesy.toMGRS(60.0, 5.0), "32VKM7697958157")
+    t.checkText("MGRS north pole area", geodesy.toMGRS(85.0, 10.0), "ZAB9645452981")
+    match geodesy.fromMGRS("51P TS 82848 14992", center: true) {
+        .ok(p) -> {
+            let (la, lo) = p
+            t.checkTrue("fromMGRS with spaces, centred ({la}, {lo})", abs(la - 14.5995) < 1e-5 && abs(lo - 120.9842) < 1e-5)
+        }
+        .failure(e) -> t.checkTrue("fromMGRS: {e.message}", false)
+    }
+    for (bad, words) in [("51", "too short"), ("51PTS123", "same number"), ("61PTS", "zone"), ("51ITS", "latitude band"),
+                         ("51PZZ", "square"), ("CAB", "polar")] {
+        match geodesy.fromMGRS(bad) {
+            .ok(_) -> t.checkTrue("fromMGRS refuses {bad}", false)
+            .failure(e) -> t.checkTrue("fromMGRS {bad} says \"{words}\" ({e.message})", e.message.contains(words))
+        }
+    }
+}
+
+fn testSpeed(_ t: bind Tally) {
+    let wgs = geodesy.wgs84Crs()
+    let t0 = now()
+    let zone3 = geodesy.epsg(3123) ?? wgs
+    let lookup = now() - t0
+    let t1 = now()
+    var sum = 0.0
+    for k in 0..100000 {
+        let (x, y) = geodesy.transform(120.0 + Float(k % 300) * 0.01, 10.0 + Float(k / 300) * 0.02, from: wgs, to: zone3)
+        sum += x + y
+    }
+    let shifted = now() - t1
+    let t2 = now()
+    var d = 0.0
+    for k in 0..100000 {
+        d += geodesy.distance(14.5, 121.0, -30.0 + Float(k % 600) * 0.1, Float(k) * 0.0036)
+    }
+    let geodesics = now() - t2
+    print("  speed: an EPSG lookup {(lookup * 1000.0).formatted(decimals: 2)} ms; 100 000 transforms with a datum shift {shifted.formatted(decimals: 2)} s; 100 000 geodesic distances {geodesics.formatted(decimals: 2)} s")
+    t.checkTrue("speed", sum.isFinite && d.isFinite && shifted < 30.0 && geodesics < 30.0)
+}
+
+fn main() {
+    var t = Tally()
+    testCases(t)
+    testText(t)
+    testSystems(t)
+    testByHand(t)
+    testFactors(t)
+    testSpeed(t)
+    print("")
+    print("Largest differences:")
+    for key in t.worst.keys.sorted() {
+        print("  {key}: {t.worst[key] ?? 0.0}")
+    }
+    for key in t.perKind.keys.sorted() {
+        print("  failures: {key}…: {t.perKind[key] ?? 0}")
+    }
+    print("{t.checks - t.failures} of {t.checks} checks passed")
+    if t.failures > 0 {
+        exit(1)
+    }
+}

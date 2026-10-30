@@ -1,0 +1,629 @@
+// geodesy: WKT, the well-known text of coordinate systems: what a
+// shapefile's .prj, a GeoPackage or a GeoTIFF says its coordinates are in.
+// It reads WKT1 (as GDAL and Esri write it) and WKT2, and writes WKT1.
+//
+// Author: Alexius Academia
+// Date: 2026-10-31
+
+// A node of WKT: KEYWORD["text", 1.5, CHILD[...], …].
+struct WktNode {
+    keyword: String
+    texts: [String] = []
+    numbers: [Float] = []
+    // Bare words like north, east, ellipsoidal.
+    words: [String] = []
+    children: [WktNode] = []
+
+    fn child(_ names: [String]) -> WktNode? {
+        for c in children {
+            if names.contains(c.keyword) {
+                return c
+            }
+        }
+        nil
+    }
+
+    fn all(_ names: [String]) -> [WktNode] {
+        children.filter { c in names.contains(c.keyword) }
+    }
+
+    fn name() -> String {
+        texts.first ?? ""
+    }
+}
+
+struct WktReader {
+    chars: [String]
+    at: Int = 0
+    problem: String = ""
+
+    fn skipSpace() {
+        while at < chars.count && (chars[at] == " " || chars[at] == "\n" || chars[at] == "\r" || chars[at] == "\t") {
+            at += 1
+        }
+    }
+
+    fn node() -> WktNode {
+        skipSpace()
+        var word = ""
+        while at < chars.count && (isPlainNameChar(chars[at])) {
+            word += chars[at]
+            at += 1
+        }
+        var n = WktNode(keyword: word.uppercase())
+        skipSpace()
+        if at >= chars.count || (chars[at] != "[" && chars[at] != "(") {
+            return n
+        }
+        let close = if chars[at] == "[" { "]" } else { ")" }
+        at += 1
+        while true {
+            skipSpace()
+            if at >= chars.count {
+                if problem.isEmpty {
+                    problem = "the WKT ends inside {word}["
+                }
+                return n
+            }
+            let ch = chars[at]
+            if ch == close {
+                at += 1
+                return n
+            }
+            if ch == "," {
+                at += 1
+                continue
+            }
+            if ch == "\"" {
+                at += 1
+                var s = ""
+                while at < chars.count {
+                    if chars[at] == "\"" {
+                        if at + 1 < chars.count && chars[at + 1] == "\"" {
+                            s += "\""
+                            at += 2
+                            continue
+                        }
+                        break
+                    }
+                    s += chars[at]
+                    at += 1
+                }
+                at += 1
+                n.texts.append(s)
+                continue
+            }
+            if isDigitChar(ch) || ch == "-" || ch == "+" || ch == "." {
+                var s = ""
+                while at < chars.count && (isDigitChar(chars[at]) || chars[at] == "-" || chars[at] == "+" || chars[at] == "." || chars[at] == "e" || chars[at] == "E") {
+                    s += chars[at]
+                    at += 1
+                }
+                n.numbers.append(Float(s) ?? (0.0 / 0.0))
+                continue
+            }
+            if isPlainNameChar(ch) {
+                let save = at
+                var w = ""
+                while at < chars.count && isPlainNameChar(chars[at]) {
+                    w += chars[at]
+                    at += 1
+                }
+                skipSpace()
+                if at < chars.count && (chars[at] == "[" || chars[at] == "(") {
+                    at = save
+                    n.children.append(node())
+                } else {
+                    n.words.append(w)
+                }
+                continue
+            }
+            if problem.isEmpty {
+                problem = "\"{ch}\" can't be here in WKT"
+            }
+            return n
+        }
+        n
+    }
+}
+
+fn isPlainNameChar(_ ch: String) -> Bool {
+    (ch >= "a" && ch <= "z") || (ch >= "A" && ch <= "Z") || (ch >= "0" && ch <= "9") || ch == "_"
+}
+
+fn wktNorm(_ s: String) -> String {
+    var out = ""
+    for ch in s.lowercase().characters {
+        if (ch >= "a" && ch <= "z") || isDigitChar(ch) {
+            out += ch
+        }
+    }
+    out
+}
+
+// The EPSG code a node's AUTHORITY or ID gives, or 0.
+fn wktCode(_ n: WktNode) -> Int {
+    if let a = n.child(["AUTHORITY", "ID"]) {
+        if wktNorm(a.name()) == "epsg" {
+            if let v = a.numbers.first {
+                return Int(v)
+            }
+            if a.texts.count > 1 {
+                return Int(a.texts[1]) ?? 0
+            }
+        }
+    }
+    0
+}
+
+// The unit factor of a node's unit child (metres or radians per unit).
+fn wktUnit(_ n: WktNode, _ names: [String], _ fallback: Float) -> Float {
+    if let u = n.child(names) {
+        if let v = u.numbers.first {
+            return v
+        }
+    }
+    fallback
+}
+
+// The geographic part: a Crs on its datum.
+fn wktGeographic(_ g: WktNode) -> Result<Crs> {
+    let code = wktCode(g)
+    if code != 0 {
+        if let c = epsg(code) {
+            if c.isGeographic() {
+                return Result.ok(value: c)
+            }
+        }
+    }
+    let datum = g.child(["DATUM", "GEODETICDATUM", "TRF", "ENSEMBLE", "DATUMENSEMBLE"]) ?? WktNode(keyword: "DATUM")
+    let sphere = datum.child(["SPHEROID", "ELLIPSOID"]) ?? g.child(["SPHEROID", "ELLIPSOID"])
+    if sphere == nil {
+        return Result.failure(error: Error("the WKT has no ellipsoid"))
+    }
+    let sph = sphere ?? WktNode(keyword: "")
+    if sph.numbers.count < 2 {
+        return Result.failure(error: Error("the WKT's ellipsoid needs a radius and an inverse flattening"))
+    }
+    let lengthUnit = wktUnit(sph, ["LENGTHUNIT", "UNIT"], 1.0)
+    let a = sph.numbers[0] * lengthUnit
+    let rf = sph.numbers[1]
+    let e = ellipsoid(a: a, f: if rf == 0.0 { 0.0 } else { 1.0 / rf }, name: sph.name())
+    var shift: [Float] = []
+    var known = false
+    // A shift named in the WKT.
+    if let t = datum.child(["TOWGS84"]) {
+        shift = t.numbers
+        if shift.count == 3 {
+            shift = [shift[0], shift[1], shift[2], 0.0, 0.0, 0.0, 0.0]
+        }
+        known = shift.count == 7
+        if known && shift.all({ v in v == 0.0 }) && a == 6378137.0 {
+            shift = []
+        }
+    } else {
+        // The datum by name: EPSG's shift for it.
+        var found = 0
+        for n in [datum.name(), g.name()] {
+            let key = "{wktNorm(n)}|"
+            for row in datumRows {
+                if row.hasPrefix(key) {
+                    found = Int(row.split("|")[1]) ?? 0
+                    break
+                }
+            }
+            if found != 0 {
+                break
+            }
+        }
+        if found != 0 {
+            if let base = epsg(found) {
+                if base.ellipsoid().a == a {
+                    shift = base.shift
+                    known = base.shiftKnown
+                }
+            }
+        }
+    }
+    let pmNode = g.child(["PRIMEM", "PRIMEMERIDIAN"])
+    var angle = wktUnit(g, ["UNIT", "ANGLEUNIT"], degree)
+    if g.child(["UNIT", "ANGLEUNIT"]) == nil {
+        // WKT2 puts the unit on the axes.
+        for n in g.all(["AXIS", "CS"]) {
+            if let u = n.child(["ANGLEUNIT", "UNIT"]) {
+                angle = u.numbers.first ?? degree
+                break
+            }
+        }
+    }
+    angle = snapAngleUnit(angle)
+    var pm = 0.0
+    if let pmn = pmNode {
+        // WKT2 gives the meridian's unit; WKT1 writers (GDAL, Esri) put it
+        // in degrees, whatever the system's angle unit.
+        let pmUnit = wktUnit(pmn, ["ANGLEUNIT", "UNIT"], degree)
+        pm = (pmn.numbers.first ?? 0.0) * pmUnit / degree
+    }
+    Result.ok(value: Crs(name: g.name(), code: code, projection: prepared(Projection(method: "longlat", ellipsoid: e)),
+                         shift: shift, shiftKnown: known, primeMeridian: pm, angleUnit: angle / degree,
+                         datumName: datum.name(), datumEllipsoid: e))
+}
+
+// An angle unit written to 16 digits, exact: a degree or a grad.
+fn snapAngleUnit(_ u: Float) -> Float {
+    if abs(u / degree - 1.0) < 1e-12 {
+        return degree
+    }
+    if abs(u / (pi / 200.0) - 1.0) < 1e-12 {
+        return pi / 200.0
+    }
+    u
+}
+
+// A PARAMETER's value in degrees (angles) or metres (lengths).
+struct WktParams {
+    values: [String: Float] = [:]
+}
+
+fn wktParamKey(_ name: String) -> String {
+    let n = wktNorm(name)
+    if n == "latitudeofnaturalorigin" {
+        return "latNatural"
+    }
+    if n == "latitudeoffalseorigin" {
+        return "latFalse"
+    }
+    if ["latitudeoforigin", "latitudeofcenter", "latitudeofprojectioncentre", "latitudeofprojectioncenter"].contains(n) {
+        return "lat0"
+    }
+    if ["centralmeridian", "longitudeofcenter", "longitudeofnaturalorigin", "longitudeoffalseorigin", "longitudeoforigin", "longitudeofprojectioncentre", "longitudeofprojectioncenter", "straightverticallongitudefrompole"].contains(n) {
+        return "lon0"
+    }
+    if ["standardparallel1", "latitudeof1ststandardparallel", "latitudeofstandardparallel", "standardparallel"].contains(n) {
+        return "lat1"
+    }
+    if ["standardparallel2", "latitudeof2ndstandardparallel"].contains(n) {
+        return "lat2"
+    }
+    if ["scalefactor", "scalefactoratnaturalorigin", "scalefactoronpseudostandardparallel"].contains(n) {
+        return "k0"
+    }
+    if ["falseeasting", "eastingatfalseorigin", "eastingatprojectioncentre"].contains(n) {
+        return "x0"
+    }
+    if ["falsenorthing", "northingatfalseorigin", "northingatprojectioncentre"].contains(n) {
+        return "y0"
+    }
+    if ["auxiliaryspheretype"].contains(n) {
+        return "aux"
+    }
+    n
+}
+
+// fromWkt(text)
+//   A system from WKT: a .prj file's PROJCS[…] or GEOGCS[…] (WKT1, as GDAL
+//   or Esri write it), or WKT2's PROJCRS[…] or GEOGCRS[…]. An EPSG code in
+//   it is used when geodesy has it; otherwise the projection is read from
+//   its parameters, and the datum's shift from its TOWGS84 or, failing
+//   that, its name.
+public fn fromWkt(_ text: String) -> Result<Crs> {
+    var r = WktReader(chars: text.trim().characters)
+    var top = r.node()
+    if !r.problem.isEmpty {
+        return Result.failure(error: Error(r.problem))
+    }
+    if top.keyword.isEmpty || !text.contains("[") && !text.contains("(") {
+        return Result.failure(error: Error("that isn't WKT, a PROJ string or an EPSG code"))
+    }
+    // WKT2's BOUNDCRS: a system with its shift to WGS84.
+    var boundShift: [Float] = []
+    if top.keyword == "BOUNDCRS" {
+        if let t = top.child(["ABRIDGEDTRANSFORMATION"]) {
+            var v: [Float] = [0, 0, 0, 0, 0, 0, 0]
+            var frame = false
+            if let m = t.child(["METHOD"]) {
+                frame = wktNorm(m.name()).contains("coordinateframe")
+            }
+            for p in t.all(["PARAMETER"]) {
+                let n = wktNorm(p.name())
+                let x = p.numbers.first ?? 0.0
+                if n.hasPrefix("xaxistranslation") { v[0] = x }
+                if n.hasPrefix("yaxistranslation") { v[1] = x }
+                if n.hasPrefix("zaxistranslation") { v[2] = x }
+                if n.hasPrefix("xaxisrotation") { v[3] = x }
+                if n.hasPrefix("yaxisrotation") { v[4] = x }
+                if n.hasPrefix("zaxisrotation") { v[5] = x }
+                if n.hasPrefix("scaledifference") { v[6] = x }
+            }
+            if frame {
+                v[3] = -v[3]
+                v[4] = -v[4]
+                v[5] = -v[5]
+            }
+            boundShift = v
+        }
+        if let s = top.child(["SOURCECRS"]) {
+            if let inner = s.children.first {
+                top = inner
+            }
+        }
+    }
+    let k = top.keyword
+    let geographic = ["GEOGCS", "GEOGCRS", "GEOGRAPHICCRS", "GEODCRS", "GEODETICCRS"]
+    let projected = ["PROJCS", "PROJCRS", "PROJECTEDCRS"]
+    var c = Crs(projection: projection("longlat"))
+    if geographic.contains(k) {
+        let code = wktCode(top)
+        if code != 0 && boundShift.isEmpty {
+            if let e = epsg(code) {
+                return Result.ok(value: e)
+            }
+        }
+        c = try wktGeographic(top)
+    } else if projected.contains(k) {
+        let code = wktCode(top)
+        if code != 0 && boundShift.isEmpty {
+            if let e = epsg(code) {
+                return Result.ok(value: e)
+            }
+        }
+        let gn = top.child(["GEOGCS", "BASEGEOGCRS", "BASEGEODCRS", "GEOGCRS"])
+        if gn == nil {
+            return Result.failure(error: Error("the WKT's PROJCS has no GEOGCS"))
+        }
+        let base = try wktGeographic(gn ?? WktNode(keyword: ""))
+        c = try wktProjection(top, base)
+    } else {
+        return Result.failure(error: Error("geodesy can't use WKT's {k}"))
+    }
+    if !boundShift.isEmpty {
+        c.shift = if boundShift.all({ v in v == 0.0 }) && c.ellipsoid().a == 6378137.0 { [] } else { boundShift }
+        c.shiftKnown = true
+    }
+    Result.ok(value: c)
+}
+
+fn wktProjection(_ top: WktNode, _ base: Crs) -> Result<Crs> {
+    // WKT1: PROJECTION + PARAMETERs; WKT2: CONVERSION[METHOD, PARAMETERs].
+    var methodName = ""
+    var params: [WktNode] = []
+    if let conv = top.child(["CONVERSION"]) {
+        methodName = (conv.child(["METHOD", "PROJECTION"]) ?? WktNode(keyword: "")).name()
+        params = conv.all(["PARAMETER"])
+    } else {
+        methodName = (top.child(["PROJECTION"]) ?? WktNode(keyword: "")).name()
+        params = top.all(["PARAMETER"])
+    }
+    let wkt2 = top.child(["CONVERSION"]) != nil
+    var linear = wktUnit(top, ["UNIT", "LENGTHUNIT"], 1.0)
+    if wkt2 && top.child(["UNIT", "LENGTHUNIT"]) == nil {
+        // WKT2 puts the unit on the axes (or the coordinate system).
+        for n in top.all(["AXIS", "CS"]) {
+            if let u = n.child(["LENGTHUNIT", "UNIT"]) {
+                linear = u.numbers.first ?? 1.0
+                break
+            }
+        }
+    }
+    let angleDeg = base.angleUnit
+    var v: [String: Float] = [:]
+    for p in params {
+        let key = wktParamKey(p.name())
+        var x = p.numbers.first ?? 0.0
+        if wkt2 {
+            if let u = p.child(["ANGLEUNIT"]) {
+                x = x * snapAngleUnit(u.numbers.first ?? degree) / degree
+            } else if let u = p.child(["LENGTHUNIT"]) {
+                x = x * (u.numbers.first ?? 1.0)
+            }
+        } else if key == "x0" || key == "y0" {
+            x = x * linear
+        } else if key == "lat0" || key == "lon0" || key == "lat1" || key == "lat2" || key == "latNatural" || key == "latFalse" {
+            x = x * angleDeg
+        }
+        v[key] = x
+    }
+    let m = wktNorm(methodName)
+    var method = ""
+    var axis = "enu"
+    var latTs = 0.0 / 0.0
+    // The origin: EPSG names it the natural origin (TM, LCC 1SP) or the
+    // false origin (LCC 2SP); in LCC 1SP variant B both appear, the
+    // natural one being the tangent parallel.
+    var lat0 = v["lat0"] ?? v["latFalse"] ?? v["latNatural"] ?? 0.0
+    var lat1 = v["lat1"] ?? 0.0
+    var lat2 = 0.0 / 0.0
+    var k0 = v["k0"] ?? 1.0
+    if m.hasPrefix("transversemercator") || m.hasPrefix("gausskruger") {
+        method = "tmerc"
+        if m.contains("south") {
+            axis = "wsu"
+        }
+    } else if m == "mercatorauxiliarysphere" || m.contains("pseudomercator") {
+        method = "webmerc"
+    } else if m.hasPrefix("mercator") {
+        method = "merc"
+        if m.contains("2sp") || m.contains("variantb") || (v["lat1"] != nil && v["k0"] == nil) {
+            latTs = v["lat1"] ?? 0.0
+        }
+    } else if m.hasPrefix("lambertconformalconic") || m.hasPrefix("lambertconicconformal") {
+        method = "lcc"
+        if m.contains("variantb") {
+            lat1 = v["latNatural"] ?? lat0
+        } else if m.contains("1sp") || v["lat1"] == nil {
+            lat1 = lat0
+        } else {
+            lat2 = v["lat2"] ?? (0.0 / 0.0)
+        }
+    } else if m.hasPrefix("albers") {
+        method = "aea"
+        lat2 = v["lat2"] ?? (0.0 / 0.0)
+    } else if m.hasPrefix("polarstereographic") || m.hasPrefix("stereographicnorthpole") || m.hasPrefix("stereographicsouthpole") {
+        method = "stere"
+        let origin = v["lat0"] ?? v["latNatural"] ?? v["latFalse"]
+        let south = m.contains("south") || (origin ?? 90.0) < 0.0 || (v["lat1"] ?? 0.0) < 0.0
+        if m.contains("variantb") || m.contains("pole") {
+            // EPSG's variant B and Esri's: the latitude of true scale.
+            latTs = v["lat1"] ?? origin ?? (if south { -90.0 } else { 90.0 })
+        } else if m == "polarstereographic" {
+            // GDAL's WKT1: latitude_of_origin is the latitude of true
+            // scale unless it's a pole (then the scale factor counts).
+            if let o = origin {
+                if abs(o) != 90.0 {
+                    latTs = o
+                }
+            }
+        }
+        lat0 = if south { -90.0 } else { 90.0 }
+    } else if m.hasPrefix("obliquestereographic") || m.hasPrefix("doublestereographic") {
+        method = "sterea"
+    } else if m == "stereographic" {
+        method = "stere"
+    } else if m.hasPrefix("lambertazimuthalequalarea") {
+        method = "laea"
+    } else if m.hasPrefix("equirectangular") || m.hasPrefix("equidistantcylindrical") || m == "platecarree" {
+        method = "eqc"
+        latTs = v["lat1"] ?? 0.0
+    } else if m.hasPrefix("cassini") {
+        method = "cass"
+    } else {
+        return Result.failure(error: Error("geodesy doesn't have the projection \"{methodName}\""))
+    }
+    var g = base.ellipsoid()
+    if method == "webmerc" {
+        g = ellipsoid(a: g.a, f: 0.0)
+    }
+    // Axes: x west or y south. Only when one axis is east or west and the
+    // other north or south: polar systems give both as "south" along
+    // meridians, which says nothing about flipping.
+    let dirs = top.all(["AXIS"]).prefix(2).map { ax in (ax.words.first ?? "").lowercase() }
+    let ew = dirs.filter { d in d == "east" || d == "west" }
+    let ns = dirs.filter { d in d == "north" || d == "south" }
+    if axis == "enu" && ew.count == 1 && ns.count == 1 {
+        axis = ew[0].substring(from: 0, to: 1) + ns[0].substring(from: 0, to: 1) + "u"
+    }
+    let p = prepared(Projection(method: method, ellipsoid: g, lat0: lat0, lon0: v["lon0"] ?? 0.0, lat1: lat1,
+                                lat2: if lat2.isNaN { 0.0 } else { lat2 }, latTs: if latTs.isNaN { 0.0 } else { latTs },
+                                k0: k0, x0: v["x0"] ?? 0.0, y0: v["y0"] ?? 0.0, hasLat2: !lat2.isNaN,
+                                hasLatTs: !latTs.isNaN))
+    var c = base
+    c.name = top.name()
+    c.code = 0
+    c.projection = p
+    c.toMeter = linear
+    c.axis = axis
+    Result.ok(value: c)
+}
+
+fn wktNumber(_ x: Float) -> String {
+    if x == floor(x) && abs(x) < 1e15 {
+        return "{Int(x)}"
+    }
+    "{x}"
+}
+
+// The WKT1 (GDAL) of a system, for a .prj file.
+fn crsToWkt(_ c: Crs) -> String {
+    let g = c.ellipsoid()
+    var datum = "DATUM[\"{if c.datumName.isEmpty { "unknown" } else { c.datumName }}\",SPHEROID[\"{if g.name.isEmpty { "unnamed" } else { g.name }}\",{wktNumber(g.a)},{wktNumber(g.inverseFlattening())}]"
+    if !c.shift.isEmpty {
+        datum += ",TOWGS84[{c.shift.map { v in wktNumber(v) }.joined(separator: ",")}]"
+    }
+    datum += "]"
+    let angle = c.angleUnit * degree
+    let unitName = if c.angleUnit == 1.0 { "degree" } else if abs(c.angleUnit - 0.9) < 1e-12 { "grad" } else { "unit" }
+    let geog = "GEOGCS[\"{c.datumName}\",{datum},PRIMEM[\"{if c.primeMeridian == 0.0 { "Greenwich" } else { "unnamed" }}\",{wktNumber(c.primeMeridian / c.angleUnit)}],UNIT[\"{unitName}\",{angle}]]"
+    if c.isGeographic() {
+        let auth = if c.code != 0 { ",AUTHORITY[\"EPSG\",\"{c.code}\"]" } else { "" }
+        return "GEOGCS[\"{c.name}\",{datum},PRIMEM[\"{if c.primeMeridian == 0.0 { "Greenwich" } else { "unnamed" }}\",{wktNumber(c.primeMeridian / c.angleUnit)}],UNIT[\"{unitName}\",{angle}],AXIS[\"Longitude\",EAST],AXIS[\"Latitude\",NORTH]{auth}]"
+    }
+    let p = c.projection
+    var params: [(String, Float)] = []
+    var name = ""
+    match p.method {
+        "tmerc" -> {
+            name = "Transverse_Mercator"
+            params = [("latitude_of_origin", p.lat0), ("central_meridian", p.lon0), ("scale_factor", p.k0)]
+        }
+        "merc" -> {
+            if p.hasLatTs {
+                name = "Mercator_2SP"
+                params = [("standard_parallel_1", p.latTs), ("central_meridian", p.lon0)]
+            } else {
+                name = "Mercator_1SP"
+                params = [("central_meridian", p.lon0), ("scale_factor", p.k0)]
+            }
+        }
+        "webmerc" -> {
+            name = "Mercator_1SP"
+            params = [("central_meridian", p.lon0), ("scale_factor", 1.0)]
+        }
+        "lcc" -> {
+            if !p.hasLat2 && p.lat1 != p.lat0 && p.k0 == 1.0 {
+                // A tangent cone whose origin isn't its parallel: as 2SP
+                // with both parallels the same.
+                name = "Lambert_Conformal_Conic_2SP"
+                params = [("standard_parallel_1", p.lat1), ("standard_parallel_2", p.lat1), ("latitude_of_origin", p.lat0), ("central_meridian", p.lon0)]
+            } else if p.hasLat2 {
+                name = "Lambert_Conformal_Conic_2SP"
+                params = [("standard_parallel_1", p.lat1), ("standard_parallel_2", p.lat2), ("latitude_of_origin", p.lat0), ("central_meridian", p.lon0)]
+            } else {
+                name = "Lambert_Conformal_Conic_1SP"
+                params = [("latitude_of_origin", p.lat0), ("central_meridian", p.lon0), ("scale_factor", p.k0)]
+            }
+        }
+        "aea" -> {
+            name = "Albers_Conic_Equal_Area"
+            params = [("standard_parallel_1", p.lat1), ("standard_parallel_2", if p.hasLat2 { p.lat2 } else { p.lat1 }), ("latitude_of_center", p.lat0), ("longitude_of_center", p.lon0)]
+        }
+        "stere" -> {
+            if p.mode == 1 || p.mode == 2 {
+                name = "Polar_Stereographic"
+                // GDAL's way: the latitude of true scale, or the pole with
+                // a scale factor.
+                if p.hasLatTs && abs(p.latTs) != 90.0 {
+                    params = [("latitude_of_origin", p.latTs), ("central_meridian", p.lon0), ("scale_factor", 1.0)]
+                } else {
+                    params = [("latitude_of_origin", p.lat0), ("central_meridian", p.lon0), ("scale_factor", p.k0)]
+                }
+            } else {
+                name = "Stereographic"
+                params = [("latitude_of_origin", p.lat0), ("central_meridian", p.lon0), ("scale_factor", p.k0)]
+            }
+        }
+        "sterea" -> {
+            name = "Oblique_Stereographic"
+            params = [("latitude_of_origin", p.lat0), ("central_meridian", p.lon0), ("scale_factor", p.k0)]
+        }
+        "laea" -> {
+            name = "Lambert_Azimuthal_Equal_Area"
+            params = [("latitude_of_center", p.lat0), ("longitude_of_center", p.lon0)]
+        }
+        "eqc" -> {
+            name = "Equirectangular"
+            params = [("standard_parallel_1", p.latTs), ("central_meridian", p.lon0)]
+        }
+        "cass" -> {
+            name = "Cassini_Soldner"
+            params = [("latitude_of_origin", p.lat0), ("central_meridian", p.lon0)]
+        }
+        _ -> {}
+    }
+    var parts: [String] = ["PROJCS[\"{c.name}\"", geog, "PROJECTION[\"{name}\"]"]
+    for (n, v) in params {
+        let shown = if n == "scale_factor" { v } else { v / c.angleUnit }
+        parts.append("PARAMETER[\"{n}\",{wktNumber(shown)}]")
+    }
+    parts.append("PARAMETER[\"false_easting\",{wktNumber(p.x0 / c.toMeter)}]")
+    parts.append("PARAMETER[\"false_northing\",{wktNumber(p.y0 / c.toMeter)}]")
+    let unitLabel = if c.toMeter == 1.0 { "metre" } else if c.toMeter == 0.3048 { "foot" } else if abs(c.toMeter - 1200.0 / 3937.0) < 1e-15 { "US survey foot" } else { "unit" }
+    parts.append("UNIT[\"{unitLabel}\",{c.toMeter}]")
+    let xd = if c.axis.hasPrefix("w") { "WEST" } else { "EAST" }
+    let yd = if c.axis.character(at: 1) == "s" { "SOUTH" } else { "NORTH" }
+    parts.append("AXIS[\"Easting\",{xd}]")
+    parts.append("AXIS[\"Northing\",{yd}]")
+    if c.code != 0 {
+        parts.append("AUTHORITY[\"EPSG\",\"{c.code}\"]")
+    }
+    parts.joined(separator: ",") + "]"
+}

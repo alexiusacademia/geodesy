@@ -1,0 +1,751 @@
+// geodesy: map projections, from latitude and longitude on an ellipsoid to
+// easting and northing on a plane and back. The formulas are PROJ's (and
+// EPSG's), so results agree with PROJ: Transverse Mercator by Krüger's
+// series to 6th order in n (exact to nanometres within 4000 km of the
+// central meridian), and the rest by their usual closed forms.
+//
+// Author: Alexius Academia
+// Date: 2026-10-31
+
+let halfPi = pi / 2.0
+
+// projection:
+//   A map projection: its method (tmerc, merc, webmerc, lcc, aea, stere,
+//   sterea, laea, eqc, cass, longlat), the ellipsoid it's worked on, and
+//   its parameters in degrees and metres: lat0, lon0 (the origin), lat1,
+//   lat2 (standard parallels), latTs (latitude of true scale), k0 (scale
+//   factor), x0, y0 (false easting and northing).
+public struct Projection {
+    method: String
+    ellipsoid: Ellipsoid
+    lat0: Float = 0.0
+    lon0: Float = 0.0
+    lat1: Float = 0.0
+    lat2: Float = 0.0
+    latTs: Float = 0.0
+    k0: Float = 1.0
+    x0: Float = 0.0
+    y0: Float = 0.0
+    hasLat2: Bool = false
+    hasLatTs: Bool = false
+    // EPSG's hyperbolic Cassini–Soldner (Vanua Levu, Fiji).
+    hyperbolic: Bool = false
+    // Constants worked out once by prepared().
+    c: [Float] = []
+    alpha: [Float] = []
+    beta: [Float] = []
+    mode: Int = 0
+
+    fn e() -> Float {
+        ellipsoid.e()
+    }
+
+    // forward(lon, lat)
+    //   Easting and northing (metres) of a longitude and latitude
+    //   (degrees, relative to the ellipsoid's prime meridian). NaN where the
+    //   projection has no value (like the far side of a polar projection).
+    fn forward(_ lon: Float, _ lat: Float) -> (Float, Float) {
+        if method == "longlat" {
+            return (lon, lat)
+        }
+        let (dl, _) = angDiff(lon0, lon)
+        let lam = dl * degree
+        let phi = lat * degree
+        let a = ellipsoid.a
+        match method {
+            "tmerc" -> tmercForward(lam, phi)
+            "merc" -> {
+                let y = asinh(tan(phi)) - e() * atanh(e() * sin(phi))
+                (x0 + a * c[0] * lam, y0 + a * c[0] * y)
+            }
+            "webmerc" -> (x0 + a * lam, y0 + a * log(tan(pi / 4.0 + phi / 2.0)))
+            "lcc" -> lccForward(lam, phi)
+            "aea" -> aeaForward(lam, phi)
+            "stere" -> stereForward(lam, phi)
+            "sterea" -> stereaForward(lam, phi)
+            "laea" -> laeaForward(lam, phi)
+            "eqc" -> (x0 + a * c[0] * lam, y0 + a * (phi - lat0 * degree))
+            "cass" -> cassForward(lam, phi)
+            _ -> (0.0 / 0.0, 0.0 / 0.0)
+        }
+    }
+
+    // inverse(x, y)
+    //   The longitude and latitude (degrees) of an easting and northing.
+    fn inverse(_ x: Float, _ y: Float) -> (Float, Float) {
+        if method == "longlat" {
+            return (x, y)
+        }
+        let a = ellipsoid.a
+        let (lam, phi) = match method {
+            "tmerc" -> tmercInverse(x, y)
+            "merc" -> ((x - x0) / (a * c[0]), atan(tauFromPsi((y - y0) / (a * c[0]))))
+            "webmerc" -> ((x - x0) / a, halfPi - 2.0 * atan(exp(-(y - y0) / a)))
+            "lcc" -> lccInverse(x, y)
+            "aea" -> aeaInverse(x, y)
+            "stere" -> stereInverse(x, y)
+            "sterea" -> stereaInverse(x, y)
+            "laea" -> laeaInverse(x, y)
+            "eqc" -> ((x - x0) / (a * c[0]), (y - y0) / a + lat0 * degree)
+            "cass" -> cassInverse(x, y)
+            _ -> (0.0 / 0.0, 0.0 / 0.0)
+        }
+        (angNormalize(lon0 + lam / degree), phi / degree)
+    }
+
+    // τ' (the tangent of the conformal latitude) from τ = tan φ.
+    fn taupf(_ tau: Float) -> Float {
+        let tau1 = hypot(1.0, tau)
+        let sig = sinh(e() * atanh(e() * tau / tau1))
+        hypot(1.0, sig) * tau - sig * tau1
+    }
+
+    // τ = tan φ from τ', by Newton's method (Karney).
+    fn tauf(_ taup: Float) -> Float {
+        let e2 = ellipsoid.e2
+        if e2 == 0.0 {
+            return taup
+        }
+        let e2m = 1.0 - e2
+        var tau = if abs(taup) > 70.0 { taup * exp(e() * atanh(e())) } else { taup / e2m }
+        let stol = 0.1 * sqrt(tol0) * max(1.0, abs(taup))
+        for _ in 0..10 {
+            let taupa = taupf(tau)
+            let dtau = (taup - taupa) * (1.0 + e2m * tau * tau) / (e2m * hypot(1.0, tau) * hypot(1.0, taupa))
+            tau += dtau
+            if !(abs(dtau) >= stol) {
+                break
+            }
+        }
+        tau
+    }
+
+    // tan φ from the isometric latitude ψ.
+    fn tauFromPsi(_ psi: Float) -> Float {
+        tauf(sinh(psi))
+    }
+
+    // The isometric latitude ψ of φ (radians).
+    fn psiOf(_ phi: Float) -> Float {
+        asinh(tan(phi)) - e() * atanh(e() * sin(phi))
+    }
+
+    // PROJ's t (Snyder's): exp(-ψ).
+    fn tsfn(_ phi: Float) -> Float {
+        let s = sin(phi)
+        tan(0.5 * (halfPi - phi)) / pow((1.0 - s * e()) / (1.0 + s * e()), 0.5 * e())
+    }
+
+    // cos φ / sqrt(1 - e² sin² φ).
+    fn msfn(_ phi: Float) -> Float {
+        let s = sin(phi)
+        cos(phi) / sqrt(1.0 - ellipsoid.e2 * s * s)
+    }
+
+    // The authalic q of sin φ.
+    fn qsfn(_ sinphi: Float) -> Float {
+        let es = ellipsoid.e2
+        if e() < 1e-7 {
+            return 2.0 * sinphi
+        }
+        let con = e() * sinphi
+        (1.0 - es) * (sinphi / (1.0 - con * con) - (0.5 / e()) * log((1.0 - con) / (1.0 + con)))
+    }
+
+    // φ from the authalic q, by Newton's method.
+    fn phiFromQ(_ qs: Float) -> Float {
+        let es = ellipsoid.e2
+        var phi = asin(max(-1.0, min(1.0, 0.5 * qs)))
+        if e() < 1e-7 {
+            return phi
+        }
+        for _ in 0..30 {
+            let s = sin(phi)
+            let co = cos(phi)
+            let con = e() * s
+            let com = 1.0 - con * con
+            let d = 0.5 * com * com / co * (qs / (1.0 - es) - s / com + 0.5 / e() * log((1.0 - con) / (1.0 + con)))
+            phi += d
+            if !(abs(d) > 1e-15) {
+                break
+            }
+        }
+        phi
+    }
+
+    // --- Transverse Mercator (Krüger series, 6th order in n).
+
+    fn tmercForward(_ lam: Float, _ phi: Float) -> (Float, Float) {
+        let tau = tan(phi)
+        let taup = taupf(tau)
+        let cl = cos(lam)
+        let xip = atan2(taup, cl)
+        let etap = asinh(sin(lam) / hypot(taup, cl))
+        var xi = xip
+        var eta = etap
+        for j in 1..7 {
+            let jj = 2.0 * Float(j)
+            xi += alpha[j] * sin(jj * xip) * cosh(jj * etap)
+            eta += alpha[j] * cos(jj * xip) * sinh(jj * etap)
+        }
+        let big = k0 * c[0]
+        (x0 + big * eta, y0 + big * xi - c[1])
+    }
+
+    fn tmercInverse(_ x: Float, _ y: Float) -> (Float, Float) {
+        let big = k0 * c[0]
+        let xi = (y - y0 + c[1]) / big
+        let eta = (x - x0) / big
+        var xip = xi
+        var etap = eta
+        for j in 1..7 {
+            let jj = 2.0 * Float(j)
+            xip -= beta[j] * sin(jj * xi) * cosh(jj * eta)
+            etap -= beta[j] * cos(jj * xi) * sinh(jj * eta)
+        }
+        let s = sinh(etap)
+        let cx = cos(xip)
+        let taup = sin(xip) / hypot(s, cx)
+        let lam = atan2(s, cx)
+        (lam, atan(tauf(taup)))
+    }
+
+    // --- Lambert conformal conic (c: n, F, rho0).
+
+    fn lccForward(_ lam: Float, _ phi: Float) -> (Float, Float) {
+        let n = c[0]
+        let a = ellipsoid.a
+        var rho = 0.0
+        if abs(abs(phi) - halfPi) < 1e-10 {
+            if phi * n <= 0.0 {
+                return (0.0 / 0.0, 0.0 / 0.0)
+            }
+        } else {
+            rho = c[1] * pow(tsfn(phi), n)
+        }
+        let t = lam * n
+        (x0 + a * k0 * rho * sin(t), y0 + a * k0 * (c[2] - rho * cos(t)))
+    }
+
+    fn lccInverse(_ x: Float, _ y: Float) -> (Float, Float) {
+        let a = ellipsoid.a
+        var n = c[0]
+        var px = (x - x0) / (a * k0)
+        var py = c[2] - (y - y0) / (a * k0)
+        var rho = hypot(px, py)
+        if rho == 0.0 {
+            return (0.0, if n > 0.0 { halfPi } else { -halfPi })
+        }
+        if n < 0.0 {
+            rho = -rho
+            px = -px
+            py = -py
+        }
+        let ts = pow(rho / c[1], 1.0 / n)
+        let phi = atan(tauFromPsi(-log(ts)))
+        (atan2(px, py) / n, phi)
+    }
+
+    // --- Albers equal-area conic (c: n, C, rho0, dd).
+
+    fn aeaForward(_ lam: Float, _ phi: Float) -> (Float, Float) {
+        let n = c[0]
+        let r = c[1] - n * qsfn(sin(phi))
+        if r < 0.0 {
+            return (0.0 / 0.0, 0.0 / 0.0)
+        }
+        let rho = c[3] * sqrt(r)
+        let t = lam * n
+        let a = ellipsoid.a
+        (x0 + a * rho * sin(t), y0 + a * (c[2] - rho * cos(t)))
+    }
+
+    fn aeaInverse(_ x: Float, _ y: Float) -> (Float, Float) {
+        let a = ellipsoid.a
+        let n = c[0]
+        var px = (x - x0) / a
+        var py = c[2] - (y - y0) / a
+        var rho = hypot(px, py)
+        if rho == 0.0 {
+            return (0.0, if n > 0.0 { halfPi } else { -halfPi })
+        }
+        if n < 0.0 {
+            rho = -rho
+            px = -px
+            py = -py
+        }
+        let r = rho / c[3]
+        let q = (c[1] - r * r) / n
+        (atan2(px, py) / n, phiFromQ(q))
+    }
+
+    // --- Stereographic, PROJ's "stere": polar (mode 1 north, 2 south),
+    // oblique (3) and equatorial (4), on the conformal sphere.
+    // c: akm1, sinX1, cosX1.
+
+    fn conformalLat(_ phi: Float) -> Float {
+        2.0 * atan(tan(0.5 * (halfPi + phi)) * pow((1.0 - e() * sin(phi)) / (1.0 + e() * sin(phi)), 0.5 * e())) - halfPi
+    }
+
+    fn stereForward(_ lam: Float, _ phi0: Float) -> (Float, Float) {
+        let a = ellipsoid.a
+        var phi = phi0
+        var cl = cos(lam)
+        let sl = sin(lam)
+        if mode == 1 || mode == 2 {
+            if mode == 2 {
+                cl = -cl
+                phi = -phi
+            }
+            if abs(phi + halfPi) < 1e-15 {
+                return (0.0 / 0.0, 0.0 / 0.0)
+            }
+            let r = c[0] * tsfn(phi)
+            return (x0 + a * r * sl, y0 - a * r * cl)
+        }
+        let chi = conformalLat(phi)
+        let sx = sin(chi)
+        let cx = cos(chi)
+        var big = 0.0
+        var py = 0.0
+        if mode == 3 {
+            big = c[0] / (c[2] * (1.0 + c[1] * sx + c[2] * cx * cl))
+            py = big * (c[2] * sx - c[1] * cx * cl)
+        } else {
+            big = c[0] / (1.0 + cx * cl)
+            py = big * sx
+        }
+        (x0 + a * big * cx * sl, y0 + a * py)
+    }
+
+    fn stereInverse(_ x: Float, _ y: Float) -> (Float, Float) {
+        let a = ellipsoid.a
+        var px = (x - x0) / a
+        var py = (y - y0) / a
+        let rho = hypot(px, py)
+        if mode == 1 || mode == 2 {
+            if mode == 1 {
+                py = -py
+            }
+            if rho == 0.0 {
+                return (0.0, if mode == 1 { halfPi } else { -halfPi })
+            }
+            let ts = rho / c[0]
+            var phi = atan(tauFromPsi(-log(ts)))
+            if mode == 2 {
+                phi = -phi
+            }
+            return (atan2(px, py), phi)
+        }
+        // On the conformal sphere: the spherical inverse, then φ from χ.
+        let ce = 2.0 * atan2(rho * (if mode == 3 { c[2] } else { 1.0 }), c[0])
+        let sc = sin(ce)
+        let cc = cos(ce)
+        let sx1 = if mode == 3 { c[1] } else { 0.0 }
+        let cx1 = if mode == 3 { c[2] } else { 1.0 }
+        var chi = 0.0
+        var lam = 0.0
+        if rho == 0.0 {
+            chi = asin(sx1)
+        } else {
+            chi = asin(cc * sx1 + py * sc * cx1 / rho)
+            lam = atan2(px * sc, rho * cx1 * cc - py * sx1 * sc)
+        }
+        // χ is conformal: tan χ = τ'.
+        (lam, atan(tauf(tan(chi))))
+    }
+
+    // --- Oblique stereographic, PROJ's "sterea" (EPSG's): the Gauss
+    // conformal sphere, then the stereographic on it.
+    // c: C, K, ratexp, chi0, rc.
+
+    fn gauss(_ lam: Float, _ phi: Float) -> (Float, Float) {
+        let p = 2.0 * atan(c[1] * pow(tan(0.5 * phi + pi / 4.0), c[0]) * pow((1.0 - e() * sin(phi)) / (1.0 + e() * sin(phi)), c[2])) - halfPi
+        (c[0] * lam, p)
+    }
+
+    fn invGauss(_ lam: Float, _ phi: Float) -> (Float, Float) {
+        let l = lam / c[0]
+        let num = pow(tan(0.5 * phi + pi / 4.0) / c[1], 1.0 / c[0])
+        var p = phi
+        for _ in 0..30 {
+            let next = 2.0 * atan(num * pow((1.0 - e() * sin(p)) / (1.0 + e() * sin(p)), -0.5 * e())) - halfPi
+            let d = abs(next - p)
+            p = next
+            if d < 1e-15 {
+                break
+            }
+        }
+        (l, p)
+    }
+
+    fn stereaForward(_ lam0: Float, _ phi0: Float) -> (Float, Float) {
+        let (lam, phi) = gauss(lam0, phi0)
+        let sc0 = sin(c[3])
+        let cc0 = cos(c[3])
+        let sinc = sin(phi)
+        let cosc = cos(phi)
+        let cosl = cos(lam)
+        let k = k0 * 2.0 * c[4] / (1.0 + sc0 * sinc + cc0 * cosc * cosl)
+        let a = ellipsoid.a
+        (x0 + a * k * cosc * sin(lam), y0 + a * k * (cc0 * sinc - sc0 * cosc * cosl))
+    }
+
+    fn stereaInverse(_ x: Float, _ y: Float) -> (Float, Float) {
+        let a = ellipsoid.a
+        let px = (x - x0) / (a * k0)
+        let py = (y - y0) / (a * k0)
+        let rho = hypot(px, py)
+        let sc0 = sin(c[3])
+        let cc0 = cos(c[3])
+        var phi = c[3]
+        var lam = 0.0
+        if rho != 0.0 {
+            let cang = 2.0 * atan2(rho, 2.0 * c[4])
+            let sinc = sin(cang)
+            let cosc = cos(cang)
+            phi = asin(cosc * sc0 + py * sinc * cc0 / rho)
+            lam = atan2(px * sinc, rho * cc0 * cosc - py * sc0 * sinc)
+        }
+        invGauss(lam, phi)
+    }
+
+    // --- Lambert azimuthal equal-area (modes as stere).
+    // c: qp, rq, sinb1, cosb1, dd, xmf, ymf.
+
+    fn laeaForward(_ lam: Float, _ phi: Float) -> (Float, Float) {
+        let a = ellipsoid.a
+        let cl = cos(lam)
+        let sl = sin(lam)
+        var q = qsfn(sin(phi))
+        if mode == 1 || mode == 2 {
+            q = if mode == 1 { c[0] - q } else { c[0] + q }
+            if q < 1e-15 {
+                return (x0, y0)
+            }
+            let b = sqrt(q)
+            return (x0 + a * b * sl, y0 + a * cl * (if mode == 2 { b } else { -b }))
+        }
+        let sinb = q / c[0]
+        let cosb = sqrt(max(0.0, 1.0 - sinb * sinb))
+        if mode == 3 {
+            let b = sqrt(2.0 / (1.0 + c[2] * sinb + c[3] * cosb * cl))
+            return (x0 + a * c[5] * b * cosb * sl, y0 + a * c[6] * b * (c[3] * sinb - c[2] * cosb * cl))
+        }
+        let b = sqrt(2.0 / (1.0 + cosb * cl))
+        (x0 + a * c[5] * b * cosb * sl, y0 + a * c[6] * b * sinb)
+    }
+
+    fn laeaInverse(_ x: Float, _ y: Float) -> (Float, Float) {
+        let a = ellipsoid.a
+        var px = (x - x0) / a
+        var py = (y - y0) / a
+        var ab = 0.0
+        if mode == 1 || mode == 2 {
+            if mode == 1 {
+                py = -py
+            }
+            let q = px * px + py * py
+            if q == 0.0 {
+                return (0.0, if mode == 1 { halfPi } else { -halfPi })
+            }
+            ab = 1.0 - q / c[0]
+            if mode == 2 {
+                ab = -ab
+            }
+            return (atan2(px, py), phiFromQ(ab * c[0]))
+        }
+        px /= c[4]
+        py *= c[4]
+        let rho = hypot(px, py)
+        if rho < 1e-15 {
+            return (0.0, phiFromQ((if mode == 3 { c[2] } else { 0.0 }) * c[0]))
+        }
+        let sce0 = 2.0 * asin(max(-1.0, min(1.0, 0.5 * rho / c[1])))
+        let cce = cos(sce0)
+        let sce = sin(sce0)
+        px *= sce
+        if mode == 3 {
+            ab = cce * c[2] + py * sce * c[3] / rho
+            py = rho * c[3] * cce - py * c[2] * sce
+        } else {
+            ab = py * sce / rho
+            py = rho * cce
+        }
+        (atan2(px, py), phiFromQ(ab * c[0]))
+    }
+
+    // --- Cassini–Soldner, as PROJ 9 has it: EPSG's series forward (with
+    // the exact meridian arc), exact spherical formulas on a sphere, and
+    // the inverse solved exactly from EPSG's inverse series. With
+    // `hyperbolic`, EPSG's hyperbolic variant (Vanua Levu). c: M0.
+
+    fn cassForward(_ lam: Float, _ phi: Float) -> (Float, Float) {
+        let a = ellipsoid.a
+        let es = ellipsoid.e2
+        if es == 0.0 {
+            let x = asin(cos(phi) * sin(lam))
+            let y = atan2(tan(phi), cos(lam)) - lat0 * degree
+            return (x0 + a * x, y0 + a * y)
+        }
+        let s = sin(phi)
+        let co = cos(phi)
+        let m = meridianArc(ellipsoid, phi) / a
+        let nu2 = 1.0 / (1.0 - es * s * s)
+        let n = sqrt(nu2)
+        let tn = tan(phi)
+        let t = tn * tn
+        let a1 = lam * co
+        let cc = es * co * co / (1.0 - es)
+        let a2 = a1 * a1
+        let x = n * a1 * (1.0 - a2 * t * (1.0 / 6.0 + (8.0 - t + 8.0 * cc) * a2 / 120.0))
+        var y = m - c[0] + n * tn * a2 * (0.5 + (5.0 - t + 6.0 * cc) * a2 / 24.0)
+        if hyperbolic {
+            let rho = nu2 * (1.0 - es) * n
+            y -= y * y * y / (6.0 * rho * n)
+        }
+        (x0 + a * x, y0 + a * y)
+    }
+
+    fn cassInverse(_ x: Float, _ y: Float) -> (Float, Float) {
+        let a = ellipsoid.a
+        if ellipsoid.e2 == 0.0 {
+            let dd = (y - y0) / a + lat0 * degree
+            let px = (x - x0) / a
+            return (atan2(tan(px), cos(dd)), asin(sin(dd) * cos(px)))
+        }
+        var (lam, phi) = cassSeriesInverse(x, y)
+        // Newton's method on the forward formulas (PROJ's generic inverse).
+        for _ in 0..15 {
+            let (fx, fy) = cassForward(lam, phi)
+            let ex = (fx - x) / a
+            let ey = (fy - y) / a
+            if abs(ex) + abs(ey) < 1e-15 {
+                break
+            }
+            let h = 1e-8
+            let (ax, ay) = cassForward(lam + h, phi)
+            let (bx, by) = cassForward(lam, phi + h)
+            let j11 = (ax - fx) / (a * h)
+            let j21 = (ay - fy) / (a * h)
+            let j12 = (bx - fx) / (a * h)
+            let j22 = (by - fy) / (a * h)
+            let det = j11 * j22 - j12 * j21
+            if det == 0.0 {
+                break
+            }
+            lam -= (j22 * ex - j12 * ey) / det
+            phi -= (-j21 * ex + j11 * ey) / det
+        }
+        (lam, phi)
+    }
+
+    fn cassSeriesInverse(_ x: Float, _ y: Float) -> (Float, Float) {
+        let a = ellipsoid.a
+        let es = ellipsoid.e2
+        let px = (x - x0) / a
+        let py = (y - y0) / a
+        let ph1 = latitudeAtArc(ellipsoid, (c[0] + py) * a)
+        let tn = tan(ph1)
+        let t = tn * tn
+        let s = sin(ph1)
+        var r = 1.0 / (1.0 - es * s * s)
+        let n = sqrt(r)
+        r *= (1.0 - es) * n
+        let dd = px / n
+        let d2 = dd * dd
+        let phi = ph1 - (n * tn / r) * d2 * (0.5 - (1.0 + 3.0 * t) * d2 / 24.0)
+        let lam = dd * (1.0 + t * d2 * (-1.0 / 3.0 + (1.0 + 3.0 * t) * d2 / 15.0)) / cos(ph1)
+        (lam, phi)
+    }
+}
+
+// The Krüger series' coefficients α (forward) and β (inverse), 1…6.
+fn krugerAlpha(_ n: Float) -> [Float] {
+    let n2 = n * n
+    let n3 = n2 * n
+    let n4 = n3 * n
+    let n5 = n4 * n
+    let n6 = n5 * n
+    [0.0,
+     n / 2.0 - 2.0 * n2 / 3.0 + 5.0 * n3 / 16.0 + 41.0 * n4 / 180.0 - 127.0 * n5 / 288.0 + 7891.0 * n6 / 37800.0,
+     13.0 * n2 / 48.0 - 3.0 * n3 / 5.0 + 557.0 * n4 / 1440.0 + 281.0 * n5 / 630.0 - 1983433.0 * n6 / 1935360.0,
+     61.0 * n3 / 240.0 - 103.0 * n4 / 140.0 + 15061.0 * n5 / 26880.0 + 167603.0 * n6 / 181440.0,
+     49561.0 * n4 / 161280.0 - 179.0 * n5 / 168.0 + 6601661.0 * n6 / 7257600.0,
+     34729.0 * n5 / 80640.0 - 3418889.0 * n6 / 1995840.0,
+     212378941.0 * n6 / 319334400.0]
+}
+
+fn krugerBeta(_ n: Float) -> [Float] {
+    let n2 = n * n
+    let n3 = n2 * n
+    let n4 = n3 * n
+    let n5 = n4 * n
+    let n6 = n5 * n
+    [0.0,
+     n / 2.0 - 2.0 * n2 / 3.0 + 37.0 * n3 / 96.0 - n4 / 360.0 - 81.0 * n5 / 512.0 + 96199.0 * n6 / 604800.0,
+     n2 / 48.0 + n3 / 15.0 - 437.0 * n4 / 1440.0 + 46.0 * n5 / 105.0 - 1118711.0 * n6 / 3870720.0,
+     17.0 * n3 / 480.0 - 37.0 * n4 / 840.0 - 209.0 * n5 / 4480.0 + 5569.0 * n6 / 90720.0,
+     4397.0 * n4 / 161280.0 - 11.0 * n5 / 504.0 - 830251.0 * n6 / 7257600.0,
+     4583.0 * n5 / 161280.0 - 108847.0 * n6 / 3991680.0,
+     20648693.0 * n6 / 638668800.0]
+}
+
+// The projection with its constants worked out, ready to use.
+fn prepared(_ p0: Projection) -> Projection {
+    var p = p0
+    p.lat0 = max(-90.0, min(90.0, p.lat0))
+    let g = p.ellipsoid
+    let phi0 = p.lat0 * degree
+    match p.method {
+        "tmerc" -> {
+            let n = g.n
+            let big = g.a / (1.0 + n) * (1.0 + n * n / 4.0 + n * n * n * n / 64.0 + n * n * n * n * n * n / 256.0)
+            p.alpha = krugerAlpha(n)
+            p.beta = krugerBeta(n)
+            p.c = [big, 0.0]
+            // The northing of the origin's latitude, on the central meridian.
+            let (s0, c0) = sincosd(p.lat0)
+            let xip = if c0 == 0.0 { copysign(halfPi, s0) } else { atan(p.taupf(s0 / c0)) }
+            var xi = xip
+            for j in 1..7 {
+                xi += p.alpha[j] * sin(2.0 * Float(j) * xip)
+            }
+            p.c[1] = p.k0 * big * xi
+        }
+        "merc" -> {
+            var k = p.k0
+            if p.hasLatTs {
+                k = p.msfn(p.latTs * degree)
+            }
+            p.c = [k]
+        }
+        "lcc" -> {
+            let phi1 = p.lat1 * degree
+            let phi2 = if p.hasLat2 { p.lat2 * degree } else { phi1 }
+            var n = sin(phi1)
+            let m1 = p.msfn(phi1)
+            let t1 = p.tsfn(phi1)
+            if abs(phi1 - phi2) >= 1e-10 {
+                n = log(m1 / p.msfn(phi2)) / log(t1 / p.tsfn(phi2))
+            }
+            let f = m1 * pow(t1, -n) / n
+            let rho0 = if abs(abs(phi0) - halfPi) < 1e-10 { 0.0 } else { f * pow(p.tsfn(phi0), n) }
+            p.c = [n, f, rho0]
+        }
+        "aea" -> {
+            let phi1 = p.lat1 * degree
+            let phi2 = if p.hasLat2 { p.lat2 * degree } else { phi1 }
+            var n = sin(phi1)
+            let m1 = p.msfn(phi1)
+            let q1 = p.qsfn(sin(phi1))
+            if abs(phi1 - phi2) >= 1e-10 {
+                let m2 = p.msfn(phi2)
+                let q2 = p.qsfn(sin(phi2))
+                n = (m1 * m1 - m2 * m2) / (q2 - q1)
+            }
+            let cc = m1 * m1 + n * q1
+            let dd = 1.0 / n
+            let rho0 = dd * sqrt(cc - n * p.qsfn(sin(phi0)))
+            p.c = [n, cc, rho0, dd]
+        }
+        "stere" -> {
+            let t = abs(phi0)
+            if abs(t - halfPi) < 1e-10 {
+                p.mode = if phi0 < 0.0 { 2 } else { 1 }
+            } else if t > 1e-10 {
+                p.mode = 3
+            } else {
+                p.mode = 4
+            }
+            if p.mode == 1 || p.mode == 2 {
+                let phits = if p.hasLatTs { abs(p.latTs * degree) } else { halfPi }
+                var akm1 = 0.0
+                if abs(phits - halfPi) < 1e-10 {
+                    let e = p.e()
+                    akm1 = 2.0 * p.k0 / sqrt(pow(1.0 + e, 1.0 + e) * pow(1.0 - e, 1.0 - e))
+                } else {
+                    akm1 = cos(phits) / p.tsfn(phits)
+                    let s = sin(phits) * p.e()
+                    akm1 /= sqrt(1.0 - s * s)
+                }
+                p.c = [akm1, 0.0, 1.0]
+            } else if p.mode == 3 {
+                let x = p.conformalLat(phi0)
+                let s = sin(phi0) * p.e()
+                p.c = [2.0 * p.k0 * cos(phi0) / sqrt(1.0 - s * s), sin(x), cos(x)]
+            } else {
+                p.c = [2.0 * p.k0, 0.0, 1.0]
+            }
+        }
+        "sterea" -> {
+            let es = g.e2
+            let sphi = sin(phi0)
+            var cphi = cos(phi0)
+            cphi *= cphi
+            let rc = sqrt(1.0 - es) / (1.0 - es * sphi * sphi)
+            let cc = sqrt(1.0 + es * cphi * cphi / (1.0 - es))
+            let chi = asin(sphi / cc)
+            let ratexp = 0.5 * cc * p.e()
+            let k = tan(0.5 * chi + pi / 4.0) / (pow(tan(0.5 * phi0 + pi / 4.0), cc) * pow((1.0 - p.e() * sphi) / (1.0 + p.e() * sphi), ratexp))
+            p.c = [cc, k, ratexp, chi, rc]
+        }
+        "laea" -> {
+            let t = abs(phi0)
+            if abs(t - halfPi) < 1e-10 {
+                p.mode = if phi0 < 0.0 { 2 } else { 1 }
+            } else if t > 1e-10 {
+                p.mode = 3
+            } else {
+                p.mode = 4
+            }
+            let qp = p.qsfn(1.0)
+            let rq = sqrt(0.5 * qp)
+            var sinb1 = 0.0
+            var cosb1 = 1.0
+            var dd = 1.0
+            var xmf = 1.0
+            var ymf = 1.0
+            if p.mode == 4 {
+                dd = 1.0 / rq
+                xmf = 1.0
+                ymf = 0.5 * qp
+            } else if p.mode == 3 {
+                let sinph = sin(phi0)
+                sinb1 = p.qsfn(sinph) / qp
+                cosb1 = sqrt(1.0 - sinb1 * sinb1)
+                dd = cos(phi0) / (sqrt(1.0 - g.e2 * sinph * sinph) * rq * cosb1)
+                xmf = rq * dd
+                ymf = rq / dd
+            }
+            p.c = [qp, rq, sinb1, cosb1, dd, xmf, ymf]
+        }
+        "eqc" -> {
+            p.c = [cos(p.latTs * degree)]
+        }
+        "cass" -> {
+            p.c = [meridianArc(g, phi0) / g.a]
+        }
+        _ -> {}
+    }
+    p
+}
+
+// projection(method, on:, lat0:, lon0:, lat1:, lat2:, latTs:, k0:, x0:, y0:)
+//   A projection by its PROJ name: "tmerc", "merc", "webmerc", "lcc",
+//   "aea", "stere", "sterea", "laea", "eqc", "cass" or "longlat".
+//   Leave lat2 or latTs out (NaN) when the projection doesn't use them.
+//
+//   let ptm3 = geodesy.projection("tmerc", on: geodesy.ellipsoidNamed("clrk66") ?? geodesy.wgs84(),
+//                                 lon0: 121, k0: 0.99995, x0: 500000)
+public fn projection(_ method: String, on: Ellipsoid = wgs84(), lat0: Float = 0.0, lon0: Float = 0.0,
+                     lat1: Float = 0.0, lat2: Float = 0.0 / 0.0, latTs: Float = 0.0 / 0.0, k0: Float = 1.0,
+                     x0: Float = 0.0, y0: Float = 0.0) -> Projection {
+    let known = ["tmerc", "merc", "webmerc", "lcc", "aea", "stere", "sterea", "laea", "eqc", "cass", "longlat"]
+    if !known.contains(method) {
+        fail("projection: \"{method}\" isn't a projection geodesy has: {known.joined(separator: ", ")}")
+    }
+    prepared(Projection(method: method, ellipsoid: on, lat0: lat0, lon0: lon0, lat1: lat1,
+                        lat2: if lat2.isNaN { 0.0 } else { lat2 }, latTs: if latTs.isNaN { 0.0 } else { latTs },
+                        k0: k0, x0: x0, y0: y0, hasLat2: !lat2.isNaN, hasLatTs: !latTs.isNaN))
+}

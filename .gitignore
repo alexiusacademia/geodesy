@@ -1,0 +1,15 @@
+# What `tessel build` makes (and the IDE's Build and Package buttons).
+/geodesy
+/geodesy.exe
+*.app/
+.DS_Store
+
+# Netlify's link to the website project.
+.netlify/
+website/.netlify/
+
+# Python caches from tools/.
+__pycache__/
+
+# Python for tools/.
+.venv/

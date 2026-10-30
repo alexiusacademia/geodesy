@@ -1,0 +1,12 @@
+# The version of Tessel this project uses: Tessel's commands, editors and
+# the IDE run it with this version, whatever version is installed (and
+# install it the first time). `tessel pin` changes it.
+tessel = "0.10.0"
+
+# What `tessel publish` publishes. Programs use the library by this name:
+# `tessel add geodesy`, then `import geodesy`.
+[library]
+name = "geodesy"
+version = "0.1.0"
+description = "Geodesy: exact distances, azimuths and areas on the ellipsoid (Karney), rhumb lines, map projections (UTM, TM, Lambert, Mercator, Albers, stereographic…), datum shifts, EPSG codes, PROJ strings, WKT, degrees as text and MGRS"
+license = "MIT"

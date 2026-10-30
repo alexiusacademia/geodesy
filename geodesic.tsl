@@ -1,0 +1,1223 @@
+// geodesy: geodesics on the ellipsoid, after C. F. F. Karney, "Algorithms
+// for geodesics", J. Geodesy 87, 43–55 (2013), and his GeographicLib (MIT
+// licence): the shortest path between two points, its length and its
+// azimuths at both ends (the inverse problem), the point at a given
+// distance and azimuth (the direct problem), and the area of polygons. It's
+// accurate to about 15 nm anywhere on the Earth, the antipodes included.
+//
+// Author: Alexius Academia
+// Date: 2026-10-31
+
+let degree = pi / 180.0
+let tiny = sqrt(2.2250738585072014e-308)
+let tol0 = 2.220446049250313e-16
+let tol1 = 200.0 * tol0
+let tol2 = sqrt(tol0)
+let tolb = tol0 * tol2
+let xthresh = 1000.0 * tol2
+let maxit1 = 20
+let maxit2 = 20 + 53 + 10
+let nOrder = 6
+
+fn sq(_ x: Float) -> Float {
+    x * x
+}
+
+// Whether x is negative, -0 included.
+fn signbit(_ x: Float) -> Bool {
+    x < 0.0 || (x == 0.0 && 1.0 / x < 0.0)
+}
+
+fn copysign(_ x: Float, _ y: Float) -> Float {
+    let m = abs(x)
+    if signbit(y) { -m } else { m }
+}
+
+fn cbrt(_ x: Float) -> Float {
+    let y = pow(abs(x), 1.0 / 3.0)
+    if x < 0.0 { -y } else { y }
+}
+
+fn atanh(_ x: Float) -> Float {
+    0.5 * log((1.0 + x) / (1.0 - x))
+}
+
+fn asinh(_ x: Float) -> Float {
+    let y = log(abs(x) + sqrt(1.0 + x * x))
+    if x < 0.0 { -y } else { y }
+}
+
+fn sinh(_ x: Float) -> Float {
+    (exp(x) - exp(-x)) / 2.0
+}
+
+fn cosh(_ x: Float) -> Float {
+    (exp(x) + exp(-x)) / 2.0
+}
+
+fn hypot(_ x: Float, _ y: Float) -> Float {
+    let ax = abs(x)
+    let ay = abs(y)
+    let big = max(ax, ay)
+    if big == 0.0 || !big.isFinite {
+        return big
+    }
+    let small = min(ax, ay) / big
+    big * sqrt(1.0 + small * small)
+}
+
+// x rounded to the nearest whole number, ties to even (like C's rint).
+fn rint(_ x: Float) -> Float {
+    let r = round(x)
+    if abs(r - x) == 0.5 {
+        let h = r / 2.0
+        if h != floor(h) {
+            return r - copysign(1.0, x)
+        }
+    }
+    r
+}
+
+// IEEE remainder: x - n y, n the nearest whole number to x / y.
+fn remainder(_ x: Float, _ y: Float) -> Float {
+    x - rint(x / y) * y
+}
+
+// The error-free sum: s = u + v, and the rounding error t.
+fn sumx(_ u: Float, _ v: Float) -> (Float, Float) {
+    let s = u + v
+    var up = s - v
+    var vpp = s - up
+    up -= u
+    vpp -= v
+    let t = if s != 0.0 { 0.0 - (up + vpp) } else { s }
+    (s, t)
+}
+
+// An angle in degrees, in [-180, 180].
+fn angNormalize(_ x: Float) -> Float {
+    let y = remainder(x, 360.0)
+    if abs(y) == 180.0 { copysign(180.0, x) } else { y }
+}
+
+fn latFix(_ x: Float) -> Float {
+    if abs(x) > 90.0 { 0.0 / 0.0 } else { x }
+}
+
+// y - x, normalized, and its rounding error.
+fn angDiff(_ x: Float, _ y: Float) -> (Float, Float) {
+    let (d0, t0) = sumx(remainder(-x, 360.0), remainder(y, 360.0))
+    var (d, t) = sumx(remainder(d0, 360.0), t0)
+    if d == 0.0 || abs(d) == 180.0 {
+        d = copysign(d, if t == 0.0 { y - x } else { -t })
+    }
+    (d, t)
+}
+
+// Rounds tiny angles to 0 (so that 1e-20 and -1e-20 behave as 0).
+fn angRound(_ x: Float) -> Float {
+    let z = 1.0 / 16.0
+    var y = abs(x)
+    let w = z - y
+    y = if w > 0.0 { z - w } else { y }
+    copysign(y, x)
+}
+
+// sin and cos of x degrees, exact at multiples of 90°.
+fn sincosd(_ x: Float) -> (Float, Float) {
+    let q = rint(x / 90.0)
+    let r = (x - q * 90.0) * degree
+    return sincosQuadrant(sin(r), cos(r), q, x)
+}
+
+fn sincosQuadrant(_ s: Float, _ c: Float, _ q: Float, _ x: Float) -> (Float, Float) {
+    let k = Int(remainder(q, 4.0) + 4.0) % 4
+    var sinx = 0.0
+    var cosx = 0.0
+    if k == 0 {
+        sinx = s
+        cosx = c
+    } else if k == 1 {
+        sinx = c
+        cosx = -s
+    } else if k == 2 {
+        sinx = -s
+        cosx = -c
+    } else {
+        sinx = -c
+        cosx = s
+    }
+    cosx += 0.0
+    if sinx == 0.0 {
+        sinx = copysign(sinx, x)
+    }
+    (sinx, cosx)
+}
+
+// sin and cos of (x + t) degrees, t a small correction.
+fn sincosde(_ x: Float, _ t: Float) -> (Float, Float) {
+    let q = rint(x / 90.0)
+    let r = angRound((x - q * 90.0) + t) * degree
+    sincosQuadrant(sin(r), cos(r), q, x)
+}
+
+// atan2 in degrees, exact at multiples of 45°.
+fn atan2d(_ y0: Float, _ x0: Float) -> Float {
+    var x = x0
+    var y = y0
+    var q = 0
+    if abs(y) > abs(x) {
+        let t = x
+        x = y
+        y = t
+        q = 2
+    }
+    if signbit(x) {
+        x = -x
+        q += 1
+    }
+    var ang = atan2(y, x) / degree
+    if q == 1 {
+        ang = copysign(180.0, y) - ang
+    } else if q == 2 {
+        ang = 90.0 - ang
+    } else if q == 3 {
+        ang = -90.0 + ang
+    }
+    ang
+}
+
+fn norm2(_ s: Float, _ c: Float) -> (Float, Float) {
+    let r = hypot(s, c)
+    (s / r, c / r)
+}
+
+// p[at] x^n + … + p[at + n].
+fn polyval(_ n: Int, _ p: [Float], _ at: Int, _ x: Float) -> Float {
+    if n < 0 {
+        return 0.0
+    }
+    var y = p[at]
+    var k = 1
+    while k <= n {
+        y = y * x + p[at + k]
+        k += 1
+    }
+    y
+}
+
+// Clenshaw summation: with sinp, Σ c[i] sin(2 i x), i = 1…n; else
+// Σ c[i] cos((2 i + 1) x), i = 0…n-1.
+fn sinCosSeries(_ sinp: Bool, _ sinx: Float, _ cosx: Float, _ c: [Float], _ n0: Int) -> Float {
+    var at = n0 + (if sinp { 1 } else { 0 })
+    let ar = 2.0 * (cosx - sinx) * (cosx + sinx)
+    var y0 = 0.0
+    var y1 = 0.0
+    var n = n0
+    if n % 2 == 1 {
+        at -= 1
+        y0 = c[at]
+    }
+    n = n / 2
+    while n > 0 {
+        n -= 1
+        at -= 1
+        y1 = ar * y0 - y1 + c[at]
+        at -= 1
+        y0 = ar * y1 - y0 + c[at]
+    }
+    if sinp { 2.0 * sinx * cosx * y0 } else { cosx * (y0 - y1) }
+}
+
+fn a1m1f(_ eps: Float) -> Float {
+    let coeff: [Float] = [1, 4, 64, 0, 256]
+    let m = nOrder / 2
+    let t = polyval(m, coeff, 0, sq(eps)) / coeff[m + 1]
+    (t + eps) / (1.0 - eps)
+}
+
+fn c1f(_ eps: Float) -> [Float] {
+    let coeff: [Float] = [-1, 6, -16, 32, -9, 64, -128, 2048, 9, -16, 768, 3, -5, 512, -7, 1280, -7, 2048]
+    seriesCoefficients(eps, coeff)
+}
+
+fn c1pf(_ eps: Float) -> [Float] {
+    let coeff: [Float] = [205, -432, 768, 1536, 4005, -4736, 3840, 12288, -225, 116, 384, -7173, 2695, 7680, 3467,
+                          7680, 38081, 61440]
+    seriesCoefficients(eps, coeff)
+}
+
+fn a2m1f(_ eps: Float) -> Float {
+    let coeff: [Float] = [-11, -28, -192, 0, 256]
+    let m = nOrder / 2
+    let t = polyval(m, coeff, 0, sq(eps)) / coeff[m + 1]
+    (t - eps) / (1.0 + eps)
+}
+
+fn c2f(_ eps: Float) -> [Float] {
+    let coeff: [Float] = [1, 2, 16, 32, 35, 64, 384, 2048, 15, 80, 768, 7, 35, 512, 63, 1280, 77, 2048]
+    seriesCoefficients(eps, coeff)
+}
+
+// c[1…6] for C1, C1p and C2: c[l] = eps^l × a polynomial in eps².
+fn seriesCoefficients(_ eps: Float, _ coeff: [Float]) -> [Float] {
+    let eps2 = sq(eps)
+    var d = eps
+    var o = 0
+    var c: [Float] = [0.0]
+    for l in 1..(nOrder + 1) {
+        let m = (nOrder - l) / 2
+        c.append(d * polyval(m, coeff, o, eps2) / coeff[o + m + 1])
+        o += m + 2
+        d *= eps
+    }
+    c
+}
+
+// ellipsoid:
+//   An ellipsoid of revolution: its equatorial radius `a` (metres) and
+//   flattening `f` (1 / 298.257223563 for WGS84). Make one with
+//   ellipsoid(a:, f:) or take one of the named ones (wgs84(),
+//   ellipsoidNamed("clrk66")).
+public struct Ellipsoid {
+    a: Float
+    f: Float
+    name: String = ""
+    // Worked out by ellipsoid():
+    b: Float = 0.0
+    f1: Float = 0.0
+    e2: Float = 0.0
+    ep2: Float = 0.0
+    n: Float = 0.0
+    c2: Float = 0.0
+    etol2: Float = 0.0
+    a3x: [Float] = []
+    c3x: [Float] = []
+    c4x: [Float] = []
+
+    // The eccentricity.
+    fn e() -> Float {
+        sqrt(abs(e2))
+    }
+
+    // The inverse flattening (0 for a sphere).
+    fn inverseFlattening() -> Float {
+        if f == 0.0 { 0.0 } else { 1.0 / f }
+    }
+
+    fn a3f(_ eps: Float) -> Float {
+        polyval(nOrder - 1, a3x, 0, eps)
+    }
+
+    fn c3f(_ eps: Float) -> [Float] {
+        var c: [Float] = [0.0]
+        var mult = 1.0
+        var o = 0
+        for l in 1..nOrder {
+            let m = nOrder - l - 1
+            mult *= eps
+            c.append(mult * polyval(m, c3x, o, eps))
+            o += m + 1
+        }
+        c
+    }
+
+    fn c4f(_ eps: Float) -> [Float] {
+        var c: [Float] = []
+        var mult = 1.0
+        var o = 0
+        for l in 0..nOrder {
+            let m = nOrder - l - 1
+            c.append(mult * polyval(m, c4x, o, eps))
+            o += m + 1
+            mult *= eps
+        }
+        c
+    }
+}
+
+// ellipsoid(a:, f:, name:)
+//   An ellipsoid with equatorial radius a and flattening f. f = 0 is a
+//   sphere.
+public fn ellipsoid(a: Float, f: Float, name: String = "") -> Ellipsoid {
+    if !(a > 0.0) || !a.isFinite || !f.isFinite || f >= 1.0 {
+        fail("ellipsoid: the radius must be above 0 and the flattening below 1, not a = {a}, f = {f}")
+    }
+    let f1 = 1.0 - f
+    let e2 = f * (2.0 - f)
+    let ep2 = e2 / sq(f1)
+    let n = f / (2.0 - f)
+    let b = a * f1
+    let c2 = (sq(a) + sq(b) * (if e2 == 0.0 { 1.0 } else { (if e2 > 0.0 { atanh(sqrt(e2)) } else { atan(sqrt(-e2)) }) / sqrt(abs(e2)) })) / 2.0
+    let etol2 = 0.1 * tol2 / sqrt(max(0.001, abs(f)) * min(1.0, 1.0 - f / 2.0) / 2.0)
+    // A3
+    let a3c: [Float] = [-3, 128, -2, -3, 64, -1, -3, -1, 16, 3, -1, -2, 8, 1, -1, 2, 1, 1]
+    var a3x: [Float] = []
+    var o = 0
+    var j = nOrder - 1
+    while j >= 0 {
+        let m = min(nOrder - j - 1, j)
+        a3x.append(polyval(m, a3c, o, n) / a3c[o + m + 1])
+        o += m + 2
+        j -= 1
+    }
+    // C3
+    let c3c: [Float] = [3, 128, 2, 5, 128, -1, 3, 3, 64, -1, 0, 1, 8, -1, 1, 4, 5, 256, 1, 3, 128, -3, -2, 3, 64, 1,
+                        -3, 2, 32, 7, 512, -10, 9, 384, 5, -9, 5, 192, 7, 512, -14, 7, 512, 21, 2560]
+    var c3x: [Float] = []
+    o = 0
+    for l in 1..nOrder {
+        j = nOrder - 1
+        while j >= l {
+            let m = min(nOrder - j - 1, j)
+            c3x.append(polyval(m, c3c, o, n) / c3c[o + m + 1])
+            o += m + 2
+            j -= 1
+        }
+    }
+    // C4
+    let c4c: [Float] = [97, 15015, 1088, 156, 45045, -224, -4784, 1573, 45045, -10656, 14144, -4576, -858, 45045,
+                        64, 624, -4576, 6864, -3003, 15015, 100, 208, 572, 3432, -12012, 30030, 45045, 1, 9009,
+                        -2944, 468, 135135, 5792, 1040, -1287, 135135, 5952, -11648, 9152, -2574, 135135, -64, -624,
+                        4576, -6864, 3003, 135135, 8, 10725, 1856, -936, 225225, -8448, 4992, -1144, 225225, -1440,
+                        4160, -4576, 1716, 225225, -136, 63063, 1024, -208, 105105, 3584, -3328, 1144, 315315, -128,
+                        135135, -2560, 832, 405405, 128, 99099]
+    var c4x: [Float] = []
+    o = 0
+    for l in 0..nOrder {
+        j = nOrder - 1
+        while j >= l {
+            let m = nOrder - j - 1
+            c4x.append(polyval(m, c4c, o, n) / c4c[o + m + 1])
+            o += m + 2
+            j -= 1
+        }
+    }
+    Ellipsoid(a: a, f: f, name: name, b: b, f1: f1, e2: e2, ep2: ep2, n: n, c2: c2, etol2: etol2, a3x: a3x, c3x: c3x,
+              c4x: c4x)
+}
+
+// The results of Lengths.
+struct LengthsOut {
+    s12b: Float = 0.0
+    m12b: Float = 0.0
+    m0: Float = 0.0
+    bigM12: Float = 0.0
+    bigM21: Float = 0.0
+}
+
+fn lengths(_ g: Ellipsoid, _ eps: Float, _ sig12: Float, _ ssig1: Float, _ csig1: Float, _ dn1: Float, _ ssig2: Float,
+           _ csig2: Float, _ dn2: Float, _ cbet1: Float, _ cbet2: Float, _ wantS: Bool) -> LengthsOut {
+    var out = LengthsOut()
+    let ca = c1f(eps)
+    var a1 = a1m1f(eps)
+    var cb = c2f(eps)
+    var a2 = a2m1f(eps)
+    let m0 = a1 - a2
+    a2 = 1.0 + a2
+    a1 = 1.0 + a1
+    var j12 = 0.0
+    if wantS {
+        let b1 = sinCosSeries(true, ssig2, csig2, ca, nOrder) - sinCosSeries(true, ssig1, csig1, ca, nOrder)
+        out.s12b = a1 * (sig12 + b1)
+        let b2 = sinCosSeries(true, ssig2, csig2, cb, nOrder) - sinCosSeries(true, ssig1, csig1, cb, nOrder)
+        j12 = m0 * sig12 + (a1 * b1 - a2 * b2)
+    } else {
+        for l in 1..(nOrder + 1) {
+            cb[l] = a1 * ca[l] - a2 * cb[l]
+        }
+        j12 = m0 * sig12 + (sinCosSeries(true, ssig2, csig2, cb, nOrder) - sinCosSeries(true, ssig1, csig1, cb, nOrder))
+    }
+    out.m0 = m0
+    out.m12b = dn2 * (csig1 * ssig2) - dn1 * (ssig1 * csig2) - csig1 * csig2 * j12
+    let csig12 = csig1 * csig2 + ssig1 * ssig2
+    let t = g.ep2 * (cbet1 - cbet2) * (cbet1 + cbet2) / (dn1 + dn2)
+    out.bigM12 = csig12 + (t * ssig2 - csig2 * j12) * ssig1 / dn1
+    out.bigM21 = csig12 - (t * ssig1 - csig1 * j12) * ssig2 / dn2
+    out
+}
+
+fn astroid(_ x: Float, _ y: Float) -> Float {
+    let p = sq(x)
+    let q = sq(y)
+    let r = (p + q - 1.0) / 6.0
+    if !(q == 0.0 && r <= 0.0) {
+        let s = p * q / 4.0
+        let r2 = sq(r)
+        let r3 = r * r2
+        let disc = s * (s + 2.0 * r3)
+        var u = r
+        if disc >= 0.0 {
+            var t3 = s + r3
+            t3 += if t3 < 0.0 { -sqrt(disc) } else { sqrt(disc) }
+            let t = cbrt(t3)
+            u += t + (if t != 0.0 { r2 / t } else { 0.0 })
+        } else {
+            let ang = atan2(sqrt(-disc), -(s + r3))
+            u += 2.0 * r * cos(ang / 3.0)
+        }
+        let v = sqrt(sq(u) + q)
+        let uv = if u < 0.0 { q / (v - u) } else { u + v }
+        let w = (uv - q) / (2.0 * v)
+        return uv / (sqrt(uv + sq(w)) + w)
+    }
+    0.0
+}
+
+struct StartOut {
+    sig12: Float
+    salp1: Float
+    calp1: Float
+    salp2: Float
+    calp2: Float
+    dnm: Float
+}
+
+fn inverseStart(_ g: Ellipsoid, _ sbet1: Float, _ cbet1: Float, _ dn1: Float, _ sbet2: Float, _ cbet2: Float,
+                _ dn2: Float, _ lam12: Float, _ slam12: Float, _ clam12: Float) -> StartOut {
+    var salp1 = 0.0
+    var calp1 = 0.0
+    var salp2 = 0.0
+    var calp2 = 0.0
+    var dnm = 0.0
+    var sig12 = -1.0
+    let sbet12 = sbet2 * cbet1 - cbet2 * sbet1
+    let cbet12 = cbet2 * cbet1 + sbet2 * sbet1
+    let shortline = cbet12 >= 0.0 && sbet12 < 0.5 && cbet2 * lam12 < 0.5
+    var somg12 = 0.0
+    var comg12 = 0.0
+    let sbet12a = sbet2 * cbet1 + cbet2 * sbet1
+    if shortline {
+        var sbetm2 = sq(sbet1 + sbet2)
+        sbetm2 /= sbetm2 + sq(cbet1 + cbet2)
+        dnm = sqrt(1.0 + g.ep2 * sbetm2)
+        let omg12 = lam12 / (g.f1 * dnm)
+        somg12 = sin(omg12)
+        comg12 = cos(omg12)
+    } else {
+        somg12 = slam12
+        comg12 = clam12
+    }
+    salp1 = cbet2 * somg12
+    calp1 = if comg12 >= 0.0 { sbet12 + cbet2 * sbet1 * sq(somg12) / (1.0 + comg12) } else { sbet12a - cbet2 * sbet1 * sq(somg12) / (1.0 - comg12) }
+    let ssig12 = hypot(salp1, calp1)
+    let csig12 = sbet1 * sbet2 + cbet1 * cbet2 * comg12
+    if shortline && ssig12 < g.etol2 {
+        salp2 = cbet1 * somg12
+        calp2 = sbet12 - cbet1 * sbet2 * (if comg12 >= 0.0 { sq(somg12) / (1.0 + comg12) } else { 1.0 - comg12 })
+        let (s2, c2) = norm2(salp2, calp2)
+        salp2 = s2
+        calp2 = c2
+        sig12 = atan2(ssig12, csig12)
+    } else if abs(g.n) > 0.1 || csig12 >= 0.0 || ssig12 >= 6.0 * abs(g.n) * pi * sq(cbet1) {
+        // The spherical start is good enough.
+    } else {
+        var x = 0.0
+        var y = 0.0
+        var lamscale = 0.0
+        var betscale = 0.0
+        let lam12x = atan2(-slam12, -clam12)
+        if g.f >= 0.0 {
+            let k2 = sq(sbet1) * g.ep2
+            let eps = k2 / (2.0 * (1.0 + sqrt(1.0 + k2)) + k2)
+            lamscale = g.f * cbet1 * g.a3f(eps) * pi
+            betscale = lamscale * cbet1
+            x = lam12x / lamscale
+            y = sbet12a / betscale
+        } else {
+            let cbet12a = cbet2 * cbet1 - sbet2 * sbet1
+            let bet12a = atan2(sbet12a, cbet12a)
+            let l = lengths(g, g.n, pi + bet12a, sbet1, -cbet1, dn1, sbet2, cbet2, dn2, cbet1, cbet2, false)
+            x = -1.0 + l.m12b / (cbet1 * cbet2 * l.m0 * pi)
+            betscale = if x < -0.01 { sbet12a / x } else { -g.f * sq(cbet1) * pi }
+            lamscale = betscale / cbet1
+            y = lam12x / lamscale
+        }
+        if y > -tol1 && x > -1.0 - xthresh {
+            if g.f >= 0.0 {
+                salp1 = min(1.0, -x)
+                calp1 = -sqrt(1.0 - sq(salp1))
+            } else {
+                calp1 = max(if x > -tol1 { 0.0 } else { -1.0 }, x)
+                salp1 = sqrt(1.0 - sq(calp1))
+            }
+        } else {
+            let k = astroid(x, y)
+            let omg12a = lamscale * (if g.f >= 0.0 { -x * k / (1.0 + k) } else { -y * (1.0 + k) / k })
+            somg12 = sin(omg12a)
+            comg12 = -cos(omg12a)
+            salp1 = cbet2 * somg12
+            calp1 = sbet12a - cbet2 * sbet1 * sq(somg12) / (1.0 - comg12)
+        }
+    }
+    if !(salp1 <= 0.0) {
+        let (s1, c1) = norm2(salp1, calp1)
+        salp1 = s1
+        calp1 = c1
+    } else {
+        salp1 = 1.0
+        calp1 = 0.0
+    }
+    StartOut(sig12: sig12, salp1: salp1, calp1: calp1, salp2: salp2, calp2: calp2, dnm: dnm)
+}
+
+struct LambdaOut {
+    lam12: Float
+    salp2: Float
+    calp2: Float
+    sig12: Float
+    ssig1: Float
+    csig1: Float
+    ssig2: Float
+    csig2: Float
+    eps: Float
+    domg12: Float
+    dlam12: Float
+}
+
+fn lambda12(_ g: Ellipsoid, _ sbet1: Float, _ cbet1: Float, _ dn1: Float, _ sbet2: Float, _ cbet2: Float, _ dn2: Float,
+            _ salp1: Float, _ calp10: Float, _ slam120: Float, _ clam120: Float, _ diffp: Bool) -> LambdaOut {
+    var calp1 = calp10
+    if sbet1 == 0.0 && calp1 == 0.0 {
+        calp1 = -tiny
+    }
+    let salp0 = salp1 * cbet1
+    let calp0 = hypot(calp1, salp1 * sbet1)
+    let somg1 = salp0 * sbet1
+    let comg1 = calp1 * cbet1
+    let (ssig1, csig1) = norm2(sbet1, calp1 * cbet1)
+    let salp2 = if cbet2 != cbet1 { salp0 / cbet2 } else { salp1 }
+    let calp2 = if cbet2 != cbet1 || abs(sbet2) != -sbet1 {
+        sqrt(sq(calp1 * cbet1) + (if cbet1 < -sbet1 { (cbet2 - cbet1) * (cbet1 + cbet2) } else { (sbet1 - sbet2) * (sbet1 + sbet2) })) / cbet2
+    } else {
+        abs(calp1)
+    }
+    let somg2 = salp0 * sbet2
+    let comg2 = calp2 * cbet2
+    let (ssig2, csig2) = norm2(sbet2, calp2 * cbet2)
+    let sig12 = atan2(max(0.0, csig1 * ssig2 - ssig1 * csig2), csig1 * csig2 + ssig1 * ssig2)
+    let somg12 = max(0.0, comg1 * somg2 - somg1 * comg2)
+    let comg12 = comg1 * comg2 + somg1 * somg2
+    let eta = atan2(somg12 * clam120 - comg12 * slam120, comg12 * clam120 + somg12 * slam120)
+    let k2 = sq(calp0) * g.ep2
+    let eps = k2 / (2.0 * (1.0 + sqrt(1.0 + k2)) + k2)
+    let ca = g.c3f(eps)
+    let b312 = sinCosSeries(true, ssig2, csig2, ca, nOrder - 1) - sinCosSeries(true, ssig1, csig1, ca, nOrder - 1)
+    let domg12 = -g.f * g.a3f(eps) * salp0 * (sig12 + b312)
+    let lam12 = eta + domg12
+    var dlam12 = 0.0
+    if diffp {
+        if calp2 == 0.0 {
+            dlam12 = -2.0 * g.f1 * dn1 / sbet1
+        } else {
+            let l = lengths(g, eps, sig12, ssig1, csig1, dn1, ssig2, csig2, dn2, cbet1, cbet2, false)
+            dlam12 = l.m12b * g.f1 / (calp2 * cbet2)
+        }
+    }
+    LambdaOut(lam12: lam12, salp2: salp2, calp2: calp2, sig12: sig12, ssig1: ssig1, csig1: csig1, ssig2: ssig2,
+              csig2: csig2, eps: eps, domg12: domg12, dlam12: dlam12)
+}
+
+// inverse:
+//   The geodesic between two points: its length `distance` (metres), the
+//   azimuths at each end (`azimuth1` leaving the first point, `azimuth2`
+//   arriving at the second, in degrees clockwise from north), the arc on
+//   the auxiliary sphere (degrees), the reduced length, the geodesic
+//   scales, and the area between the geodesic and the equator (for polygon
+//   areas).
+public struct Inverse {
+    distance: Float
+    azimuth1: Float
+    azimuth2: Float
+    arc: Float
+    reducedLength: Float
+    scale12: Float
+    scale21: Float
+    area: Float
+}
+
+fn genInverse(_ g: Ellipsoid, _ lat1in: Float, _ lon1: Float, _ lat2in: Float, _ lon2: Float) -> (Inverse, Float, Float, Float, Float) {
+    var lat1 = lat1in
+    var lat2 = lat2in
+    var bigM12 = 0.0
+    var bigM21 = 0.0
+    var s12x = 0.0
+    var m12x = 0.0
+    var a12 = 0.0
+    var sig12 = 0.0
+    var calp1 = 0.0
+    var salp1 = 0.0
+    var calp2 = 0.0
+    var salp2 = 0.0
+    var omg12 = 0.0
+    var somg12 = 2.0
+    var comg12 = 0.0
+    var (lon12, lon12s) = angDiff(lon1, lon2)
+    var lonsign = if signbit(lon12) { -1.0 } else { 1.0 }
+    lon12 *= lonsign
+    lon12s *= lonsign
+    let lam12 = lon12 * degree
+    let (slam12, clam12) = sincosde(lon12, lon12s)
+    lon12s = (180.0 - lon12) - lon12s
+    lat1 = angRound(latFix(lat1))
+    lat2 = angRound(latFix(lat2))
+    let swapp = if abs(lat1) < abs(lat2) || lat2.isNaN { -1.0 } else { 1.0 }
+    if swapp < 0.0 {
+        lonsign *= -1.0
+        let t = lat1
+        lat1 = lat2
+        lat2 = t
+    }
+    let latsign = if signbit(lat1) { 1.0 } else { -1.0 }
+    lat1 *= latsign
+    lat2 *= latsign
+    var (sbet1, cbet1) = sincosd(lat1)
+    sbet1 *= g.f1
+    let (sb1, cb1) = norm2(sbet1, cbet1)
+    sbet1 = sb1
+    cbet1 = max(tiny, cb1)
+    var (sbet2, cbet2) = sincosd(lat2)
+    sbet2 *= g.f1
+    let (sb2, cb2) = norm2(sbet2, cbet2)
+    sbet2 = sb2
+    cbet2 = max(tiny, cb2)
+    if cbet1 < -sbet1 {
+        if cbet2 == cbet1 {
+            sbet2 = copysign(sbet1, sbet2)
+        }
+    } else {
+        if abs(sbet2) == -sbet1 {
+            cbet2 = cbet1
+        }
+    }
+    let dn1 = sqrt(1.0 + g.ep2 * sq(sbet1))
+    let dn2 = sqrt(1.0 + g.ep2 * sq(sbet2))
+    var meridian = lat1 == -90.0 || slam12 == 0.0
+    if meridian {
+        calp1 = clam12
+        salp1 = slam12
+        calp2 = 1.0
+        salp2 = 0.0
+        let ssig1 = sbet1
+        let csig1 = calp1 * cbet1
+        let ssig2 = sbet2
+        let csig2 = calp2 * cbet2
+        sig12 = atan2(max(0.0, csig1 * ssig2 - ssig1 * csig2), csig1 * csig2 + ssig1 * ssig2)
+        let l = lengths(g, g.n, sig12, ssig1, csig1, dn1, ssig2, csig2, dn2, cbet1, cbet2, true)
+        s12x = l.s12b
+        m12x = l.m12b
+        bigM12 = l.bigM12
+        bigM21 = l.bigM21
+        if sig12 < 1.0 || m12x >= 0.0 {
+            if sig12 < 3.0 * tiny || (sig12 < tol0 && (s12x < 0.0 || m12x < 0.0)) {
+                sig12 = 0.0
+                m12x = 0.0
+                s12x = 0.0
+            }
+            m12x *= g.b
+            s12x *= g.b
+            a12 = sig12 / degree
+        } else {
+            meridian = false
+        }
+    }
+    if !meridian && sbet1 == 0.0 && (g.f <= 0.0 || lon12s >= g.f * 180.0) {
+        // Along the equator.
+        calp1 = 0.0
+        calp2 = 0.0
+        salp1 = 1.0
+        salp2 = 1.0
+        s12x = g.a * lam12
+        sig12 = lam12 / g.f1
+        omg12 = sig12
+        m12x = g.b * sin(sig12)
+        bigM12 = cos(sig12)
+        bigM21 = bigM12
+        a12 = lon12 / g.f1
+    } else if !meridian {
+        let st = inverseStart(g, sbet1, cbet1, dn1, sbet2, cbet2, dn2, lam12, slam12, clam12)
+        sig12 = st.sig12
+        salp1 = st.salp1
+        calp1 = st.calp1
+        if sig12 >= 0.0 {
+            // A short line.
+            salp2 = st.salp2
+            calp2 = st.calp2
+            let dnm = st.dnm
+            s12x = sig12 * g.b * dnm
+            m12x = sq(dnm) * g.b * sin(sig12 / dnm)
+            bigM12 = cos(sig12 / dnm)
+            bigM21 = bigM12
+            a12 = sig12 / degree
+            omg12 = lam12 / (g.f1 * dnm)
+        } else {
+            // Newton's method, with bisection when it strays.
+            var ssig1 = 0.0
+            var csig1 = 0.0
+            var ssig2 = 0.0
+            var csig2 = 0.0
+            var eps = 0.0
+            var domg12 = 0.0
+            var numit = 0
+            var salp1a = tiny
+            var calp1a = 1.0
+            var salp1b = tiny
+            var calp1b = -1.0
+            var tripn = false
+            var tripb = false
+            while true {
+                let lo = lambda12(g, sbet1, cbet1, dn1, sbet2, cbet2, dn2, salp1, calp1, slam12, clam12, numit < maxit1)
+                let v = lo.lam12
+                let dv = lo.dlam12
+                salp2 = lo.salp2
+                calp2 = lo.calp2
+                sig12 = lo.sig12
+                ssig1 = lo.ssig1
+                csig1 = lo.csig1
+                ssig2 = lo.ssig2
+                csig2 = lo.csig2
+                eps = lo.eps
+                domg12 = lo.domg12
+                if tripb || !(abs(v) >= (if tripn { 8.0 } else { 1.0 }) * tol0) || numit == maxit2 {
+                    break
+                }
+                if v > 0.0 && (numit > maxit1 || calp1 / salp1 > calp1b / salp1b) {
+                    salp1b = salp1
+                    calp1b = calp1
+                } else if v < 0.0 && (numit > maxit1 || calp1 / salp1 < calp1a / salp1a) {
+                    salp1a = salp1
+                    calp1a = calp1
+                }
+                numit += 1
+                if numit - 1 < maxit1 && dv > 0.0 {
+                    let dalp1 = -v / dv
+                    if abs(dalp1) < pi {
+                        let sdalp1 = sin(dalp1)
+                        let cdalp1 = cos(dalp1)
+                        let nsalp1 = salp1 * cdalp1 + calp1 * sdalp1
+                        if nsalp1 > 0.0 {
+                            calp1 = calp1 * cdalp1 - salp1 * sdalp1
+                            salp1 = nsalp1
+                            let (s, c) = norm2(salp1, calp1)
+                            salp1 = s
+                            calp1 = c
+                            tripn = abs(v) <= 16.0 * tol0
+                            continue
+                        }
+                    }
+                }
+                salp1 = (salp1a + salp1b) / 2.0
+                calp1 = (calp1a + calp1b) / 2.0
+                let (s, c) = norm2(salp1, calp1)
+                salp1 = s
+                calp1 = c
+                tripn = false
+                tripb = abs(salp1a - salp1) + (calp1a - calp1) < tolb || abs(salp1 - salp1b) + (calp1 - calp1b) < tolb
+            }
+            let l = lengths(g, eps, sig12, ssig1, csig1, dn1, ssig2, csig2, dn2, cbet1, cbet2, true)
+            s12x = l.s12b
+            m12x = l.m12b
+            bigM12 = l.bigM12
+            bigM21 = l.bigM21
+            m12x *= g.b
+            s12x *= g.b
+            a12 = sig12 / degree
+            let sdomg12 = sin(domg12)
+            let cdomg12 = cos(domg12)
+            somg12 = slam12 * cdomg12 - clam12 * sdomg12
+            comg12 = clam12 * cdomg12 + slam12 * sdomg12
+        }
+    }
+    let s12 = 0.0 + s12x
+    let m12 = 0.0 + m12x
+    // The area to the equator.
+    let salp0 = salp1 * cbet1
+    let calp0 = hypot(calp1, salp1 * sbet1)
+    var bigS12 = 0.0
+    if calp0 != 0.0 && salp0 != 0.0 {
+        let (ssig1, csig1) = norm2(sbet1, calp1 * cbet1)
+        let (ssig2, csig2) = norm2(sbet2, calp2 * cbet2)
+        let k2 = sq(calp0) * g.ep2
+        let eps = k2 / (2.0 * (1.0 + sqrt(1.0 + k2)) + k2)
+        let a4 = sq(g.a) * calp0 * salp0 * g.e2
+        let c4 = g.c4f(eps)
+        let b41 = sinCosSeries(false, ssig1, csig1, c4, nOrder)
+        let b42 = sinCosSeries(false, ssig2, csig2, c4, nOrder)
+        bigS12 = a4 * (b42 - b41)
+    }
+    if !meridian && somg12 == 2.0 {
+        somg12 = sin(omg12)
+        comg12 = cos(omg12)
+    }
+    var alp12 = 0.0
+    if !meridian && comg12 > -0.7071 && sbet2 - sbet1 < 1.75 {
+        let domg12 = 1.0 + comg12
+        let dbet1 = 1.0 + cbet1
+        let dbet2 = 1.0 + cbet2
+        alp12 = 2.0 * atan2(somg12 * (sbet1 * dbet2 + sbet2 * dbet1), domg12 * (sbet1 * sbet2 + dbet1 * dbet2))
+    } else {
+        var salp12 = salp2 * calp1 - calp2 * salp1
+        var calp12 = calp2 * calp1 + salp2 * salp1
+        if salp12 == 0.0 && calp12 < 0.0 {
+            salp12 = tiny * calp1
+            calp12 = -1.0
+        }
+        alp12 = atan2(salp12, calp12)
+    }
+    bigS12 += g.c2 * alp12
+    bigS12 *= swapp * lonsign * latsign
+    bigS12 += 0.0
+    if swapp < 0.0 {
+        var t = salp1
+        salp1 = salp2
+        salp2 = t
+        t = calp1
+        calp1 = calp2
+        calp2 = t
+        t = bigM12
+        bigM12 = bigM21
+        bigM21 = t
+    }
+    salp1 *= swapp * lonsign
+    calp1 *= swapp * latsign
+    salp2 *= swapp * lonsign
+    calp2 *= swapp * latsign
+    let result = Inverse(distance: s12, azimuth1: atan2d(salp1, calp1), azimuth2: atan2d(salp2, calp2), arc: a12,
+                         reducedLength: m12, scale12: bigM12, scale21: bigM21, area: bigS12)
+    (result, salp1, calp1, salp2, calp2)
+}
+
+// A geodesic line from a point: everything needed to find points along it.
+public struct GeodesicLine {
+    lat1: Float
+    lon1: Float
+    azi1: Float
+    g: Ellipsoid
+    salp1: Float = 0.0
+    calp1: Float = 0.0
+    dn1: Float = 0.0
+    salp0: Float = 0.0
+    calp0: Float = 0.0
+    ssig1: Float = 0.0
+    csig1: Float = 0.0
+    somg1: Float = 0.0
+    comg1: Float = 0.0
+    k2: Float = 0.0
+    a1m1: Float = 0.0
+    c1a: [Float] = []
+    b11: Float = 0.0
+    stau1: Float = 0.0
+    ctau1: Float = 0.0
+    c1pa: [Float] = []
+    a2m1: Float = 0.0
+    c2a: [Float] = []
+    b21: Float = 0.0
+    c3a: [Float] = []
+    a3c: Float = 0.0
+    b31: Float = 0.0
+    c4a: [Float] = []
+    a4: Float = 0.0
+    b41: Float = 0.0
+    // The length of the line, for lines made between two points.
+    length: Float = 0.0
+
+    // position(distance)
+    //   The point `distance` metres along the line (negative: behind its
+    //   start), with the azimuth there: (latitude, longitude, azimuth).
+    //   Longitudes go on past ±180 continuously.
+    fn position(_ distance: Float) -> (Float, Float, Float) {
+        let (lat, lon, azi, _, _) = genPosition(false, distance)
+        (lat, lon, azi)
+    }
+
+    // positionAtArc(arc)
+    //   The point at an arc (degrees on the auxiliary sphere) along the line.
+    fn positionAtArc(_ arc: Float) -> (Float, Float, Float) {
+        let (lat, lon, azi, _, _) = genPosition(true, arc)
+        (lat, lon, azi)
+    }
+
+    // (lat2, lon2, azi2, s12, S12)
+    fn genPosition(_ arcmode: Bool, _ s12a12: Float) -> (Float, Float, Float, Float, Float) {
+        var sig12 = 0.0
+        var ssig12 = 0.0
+        var csig12 = 0.0
+        var b12 = 0.0
+        var ab1 = 0.0
+        if arcmode {
+            sig12 = s12a12 * degree
+            let (s, c) = sincosd(s12a12)
+            ssig12 = s
+            csig12 = c
+        } else {
+            let tau12 = s12a12 / (g.b * (1.0 + a1m1))
+            let s = sin(tau12)
+            let c = cos(tau12)
+            b12 = -sinCosSeries(true, stau1 * c + ctau1 * s, ctau1 * c - stau1 * s, c1pa, nOrder)
+            sig12 = tau12 - (b12 - b11)
+            ssig12 = sin(sig12)
+            csig12 = cos(sig12)
+            if abs(g.f) > 0.01 {
+                let ssig2a = ssig1 * csig12 + csig1 * ssig12
+                let csig2a = csig1 * csig12 - ssig1 * ssig12
+                b12 = sinCosSeries(true, ssig2a, csig2a, c1a, nOrder)
+                let serr = (1.0 + a1m1) * (sig12 + (b12 - b11)) - s12a12 / g.b
+                sig12 = sig12 - serr / sqrt(1.0 + k2 * sq(ssig2a))
+                ssig12 = sin(sig12)
+                csig12 = cos(sig12)
+            }
+        }
+        let ssig2 = ssig1 * csig12 + csig1 * ssig12
+        var csig2 = csig1 * csig12 - ssig1 * ssig12
+        if arcmode || abs(g.f) > 0.01 {
+            b12 = sinCosSeries(true, ssig2, csig2, c1a, nOrder)
+        }
+        ab1 = (1.0 + a1m1) * (b12 - b11)
+        let sbet2 = calp0 * ssig2
+        var cbet2 = hypot(salp0, calp0 * csig2)
+        if cbet2 == 0.0 {
+            cbet2 = tiny
+            csig2 = tiny
+        }
+        let somg2 = salp0 * ssig2
+        let comg2 = csig2
+        let salp2 = salp0
+        let calp2 = calp0 * csig2
+        let e = copysign(1.0, salp0)
+        let omg12 = e * (sig12 - (atan2(ssig2, csig2) - atan2(ssig1, csig1)) + (atan2(e * somg2, comg2) - atan2(e * somg1, comg1)))
+        let lam12 = omg12 + a3c * (sig12 + (sinCosSeries(true, ssig2, csig2, c3a, nOrder - 1) - b31))
+        let lon12 = lam12 / degree
+        let lon2 = lon1 + lon12
+        let lat2 = atan2d(sbet2, g.f1 * cbet2)
+        let azi2 = atan2d(salp2, calp2)
+        let s12 = if arcmode { g.b * ((1.0 + a1m1) * sig12 + ab1) } else { s12a12 }
+        let b42 = sinCosSeries(false, ssig2, csig2, c4a, nOrder)
+        var salp12 = 0.0
+        var calp12 = 0.0
+        if calp0 == 0.0 || salp0 == 0.0 {
+            salp12 = salp2 * calp1 - calp2 * salp1
+            calp12 = calp2 * calp1 + salp2 * salp1
+        } else {
+            salp12 = calp0 * salp0 * (if csig12 <= 0.0 { csig1 * (1.0 - csig12) + ssig12 * ssig1 } else { ssig12 * (csig1 * ssig12 / (1.0 + csig12) + ssig1) })
+            calp12 = sq(salp0) + sq(calp0) * csig1 * csig2
+        }
+        let bigS12 = g.c2 * atan2(salp12, calp12) + a4 * (b42 - b41)
+        (lat2, lon2, azi2, s12, bigS12)
+    }
+
+    // points(count)
+    //   `count` points evenly spaced along the line, its ends included, as
+    //   latitudes and longitudes: for drawing a geodesic on a map.
+    fn points(_ count: Int) -> ([Float], [Float]) {
+        var lats: [Float] = []
+        var lons: [Float] = []
+        let n = max(2, count)
+        for k in 0..n {
+            let (lat, lon, _) = position(length * Float(k) / Float(n - 1))
+            lats.append(lat)
+            lons.append(lon)
+        }
+        (lats, lons)
+    }
+}
+
+fn makeLine(_ g: Ellipsoid, _ lat1: Float, _ lon1: Float, _ azi1in: Float, _ salp1: Float, _ calp1: Float) -> GeodesicLine {
+    var l = GeodesicLine(lat1: latFix(lat1), lon1: lon1, azi1: azi1in, g: g, salp1: salp1, calp1: calp1)
+    var (sbet1, cbet1) = sincosd(angRound(l.lat1))
+    sbet1 *= g.f1
+    let (sb, cb) = norm2(sbet1, cbet1)
+    sbet1 = sb
+    cbet1 = max(tiny, cb)
+    l.dn1 = sqrt(1.0 + g.ep2 * sq(sbet1))
+    l.salp0 = salp1 * cbet1
+    l.calp0 = hypot(calp1, salp1 * sbet1)
+    l.somg1 = l.salp0 * sbet1
+    let c0 = if sbet1 != 0.0 || calp1 != 0.0 { cbet1 * calp1 } else { 1.0 }
+    l.comg1 = c0
+    let (ss, cs) = norm2(sbet1, c0)
+    l.ssig1 = ss
+    l.csig1 = cs
+    l.k2 = sq(l.calp0) * g.ep2
+    let eps = l.k2 / (2.0 * (1.0 + sqrt(1.0 + l.k2)) + l.k2)
+    l.a1m1 = a1m1f(eps)
+    l.c1a = c1f(eps)
+    l.b11 = sinCosSeries(true, l.ssig1, l.csig1, l.c1a, nOrder)
+    let s = sin(l.b11)
+    let c = cos(l.b11)
+    l.stau1 = l.ssig1 * c + l.csig1 * s
+    l.ctau1 = l.csig1 * c - l.ssig1 * s
+    l.c1pa = c1pf(eps)
+    l.a2m1 = a2m1f(eps)
+    l.c2a = c2f(eps)
+    l.b21 = sinCosSeries(true, l.ssig1, l.csig1, l.c2a, nOrder)
+    l.c3a = g.c3f(eps)
+    l.a3c = -g.f * l.salp0 * g.a3f(eps)
+    l.b31 = sinCosSeries(true, l.ssig1, l.csig1, l.c3a, nOrder - 1)
+    l.c4a = g.c4f(eps)
+    l.a4 = sq(g.a) * l.calp0 * l.salp0 * g.e2
+    l.b41 = sinCosSeries(false, l.ssig1, l.csig1, l.c4a, nOrder)
+    l
+}
+
+// The checks every public function makes on a point.
+fn checkLatLon(_ what: String, _ lat: Float, _ lon: Float) {
+    if !(abs(lat) <= 90.0) || !lon.isFinite {
+        fail("{what}: a latitude must be from -90 to 90 and a longitude an ordinary number, not ({lat}, {lon})")
+    }
+}
+
+// inverse(lat1, lon1, lat2, lon2, on:)
+//   The shortest path between two points on the ellipsoid (WGS84 unless
+//   `on` says): its length, and its azimuth at each end. Latitudes and
+//   longitudes are in degrees.
+//
+//   let r = geodesy.inverse(14.5995, 120.9842, 10.3157, 123.8854)   // Manila to Cebu
+//   print(r.distance)       // 569 218.2… m
+public fn inverse(_ lat1: Float, _ lon1: Float, _ lat2: Float, _ lon2: Float, on: Ellipsoid = wgs84()) -> Inverse {
+    checkLatLon("inverse", lat1, lon1)
+    checkLatLon("inverse", lat2, lon2)
+    let (r, _, _, _, _) = genInverse(on, lat1, lon1, lat2, lon2)
+    r
+}
+
+// distance(lat1, lon1, lat2, lon2, on:)
+//   The length in metres of the shortest path between two points.
+public fn distance(_ lat1: Float, _ lon1: Float, _ lat2: Float, _ lon2: Float, on: Ellipsoid = wgs84()) -> Float {
+    inverse(lat1, lon1, lat2, lon2, on: on).distance
+}
+
+// direct(lat, lon, azimuth:, distance:, on:)
+//   The point `distance` metres from (lat, lon) along the geodesic that
+//   leaves it at `azimuth` degrees clockwise from north, and the azimuth
+//   there: (latitude, longitude, azimuth). The longitude is in [-180, 180].
+public fn direct(_ lat: Float, _ lon: Float, azimuth: Float, distance: Float, on: Ellipsoid = wgs84()) -> (Float, Float, Float) {
+    checkLatLon("direct", lat, lon)
+    let l = line(lat, lon, azimuth: azimuth, on: on)
+    let (lat2, lon2, azi2) = l.position(distance)
+    (lat2, angNormalize(lon2), azi2)
+}
+
+// line(lat, lon, azimuth:, on:)
+//   The geodesic leaving (lat, lon) at an azimuth, to find points along it
+//   with position(distance).
+public fn line(_ lat: Float, _ lon: Float, azimuth: Float, on: Ellipsoid = wgs84()) -> GeodesicLine {
+    checkLatLon("line", lat, lon)
+    let azi = angNormalize(azimuth)
+    let (salp1, calp1) = sincosd(angRound(azi))
+    makeLine(on, lat, lon, azi, salp1, calp1)
+}
+
+// lineBetween(lat1, lon1, lat2, lon2, on:)
+//   The geodesic from one point to another; its `length` is the distance,
+//   and points(n) gives points along it.
+public fn lineBetween(_ lat1: Float, _ lon1: Float, _ lat2: Float, _ lon2: Float, on: Ellipsoid = wgs84()) -> GeodesicLine {
+    checkLatLon("lineBetween", lat1, lon1)
+    checkLatLon("lineBetween", lat2, lon2)
+    let (r, salp1, calp1, _, _) = genInverse(on, lat1, lon1, lat2, lon2)
+    var l = makeLine(on, lat1, lon1, r.azimuth1, salp1, calp1)
+    l.length = r.distance
+    l
+}
+
+// An exact running sum (a double-double), for polygon areas.
+struct Accumulator {
+    s: Float = 0.0
+    t: Float = 0.0
+
+    fn add(_ y: Float) {
+        let (u0, uerr) = sumx(y, t)
+        let (s2, t2) = sumx(u0, s)
+        s = s2
+        t = t2
+        if s == 0.0 {
+            s = uerr
+        } else {
+            t += uerr
+        }
+    }
+
+    fn remainderBy(_ y: Float) {
+        s = remainder(s, y)
+        add(0.0)
+    }
+}
+
+// 1 if the edge from lon1 to lon2 crosses the meridian 0 going east, -1
+// going west, else 0.
+fn transit(_ lon1in: Float, _ lon2in: Float) -> Int {
+    let (lon12, _) = angDiff(lon1in, lon2in)
+    let lon1 = angNormalize(lon1in)
+    let lon2 = angNormalize(lon2in)
+    if lon12 > 0.0 && ((lon1 < 0.0 && lon2 >= 0.0) || (lon1 > 0.0 && lon2 == 0.0)) {
+        return 1
+    }
+    if lon12 < 0.0 && lon1 >= 0.0 && lon2 < 0.0 { -1 } else { 0 }
+}
+
+// polygonArea(lats, lons, on:)
+//   The area (square metres) and perimeter (metres) of the polygon whose
+//   corners are the points, joined by geodesics, on the ellipsoid. The area
+//   is positive when the corners go counterclockwise (seen from above),
+//   negative clockwise. The last point joins the first; don't repeat it.
+//
+//   let (area, perimeter) = geodesy.polygonArea(lats, lons)
+public fn polygonArea(_ lats: [Float], _ lons: [Float], on: Ellipsoid = wgs84()) -> (Float, Float) {
+    if lats.count != lons.count {
+        fail("polygonArea: {lats.count} latitudes but {lons.count} longitudes")
+    }
+    let n = lats.count
+    if n < 2 {
+        return (0.0, 0.0)
+    }
+    for k in 0..n {
+        checkLatLon("polygonArea", lats[k], lons[k])
+    }
+    var area = Accumulator()
+    var perimeter = Accumulator()
+    var crossings = 0
+    for k in 0..n {
+        let j = (k + 1) % n
+        let (r, _, _, _, _) = genInverse(on, lats[k], lons[k], lats[j], lons[j])
+        perimeter.add(r.distance)
+        area.add(r.area)
+        crossings += transit(lons[k], lons[j])
+    }
+    let area0 = 4.0 * pi * on.c2
+    area.remainderBy(area0)
+    if crossings % 2 != 0 {
+        area.add(if area.s < 0.0 { area0 / 2.0 } else { -area0 / 2.0 })
+    }
+    // Counterclockwise positive, in (-area0/2, area0/2].
+    area.s = -area.s
+    area.t = -area.t
+    if area.s > area0 / 2.0 {
+        area.add(-area0)
+    } else if area.s <= -area0 / 2.0 {
+        area.add(area0)
+    }
+    (0.0 + area.s, perimeter.s)
+}
+
+// trackLength(lats, lons, on:)
+//   The length of a path through the points in order (a GPS track), along
+//   geodesics, in metres.
+public fn trackLength(_ lats: [Float], _ lons: [Float], on: Ellipsoid = wgs84()) -> Float {
+    if lats.count != lons.count {
+        fail("trackLength: {lats.count} latitudes but {lons.count} longitudes")
+    }
+    var total = Accumulator()
+    if lats.count < 2 {
+        return 0.0
+    }
+    for k in 1..lats.count {
+        checkLatLon("trackLength", lats[k], lons[k])
+        let (r, _, _, _, _) = genInverse(on, lats[k - 1], lons[k - 1], lats[k], lons[k])
+        total.add(r.distance)
+    }
+    total.s
+}
+
+fn fail(_ message: String) {
+    print("geodesy: {message}")
+    exit(1)
+}

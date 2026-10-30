@@ -1,0 +1,762 @@
+// geodesy: coordinate reference systems. A Crs is latitude and longitude on
+// a datum (geographic), or a projection of them (projected), with the
+// shift from its datum to WGS84. Systems come from EPSG codes, PROJ strings
+// or WKT, and transform() takes coordinates from any one to any other: up
+// to latitude and longitude, across to WGS84 and over to the other datum
+// when the datums differ, and down through the other projection.
+//
+// Author: Alexius Academia
+// Date: 2026-10-31
+
+// crs:
+//   A coordinate reference system. Coordinates are always (x, y) =
+//   (easting, northing), or (longitude, latitude) for a geographic one,
+//   whatever order EPSG lists the axes in.
+//   - projection: the map projection ("longlat" for geographic systems),
+//     with the datum's ellipsoid.
+//   - shift: the 7-parameter Helmert from the datum to WGS84 (tx, ty, tz in
+//     metres, rx, ry, rz in arc-seconds, s in parts per million, position
+//     vector convention, as PROJ's +towgs84), or [] for none.
+//   - shiftKnown: false when no Helmert to WGS84 is known for the datum;
+//     its coordinates are then taken as WGS84's, as PROJ's "ballpark" does
+//     (good to tens or hundreds of metres).
+//   - primeMeridian: degrees east of Greenwich (2.337… for Paris).
+//   - toMeter: metres in the projected unit (0.3048 for feet).
+//   - angleUnit: degrees in the geographic unit (0.9 for grads).
+//   - axis: "enu", or "wsu" and the like for systems whose x grows west or
+//     y south.
+public struct Crs {
+    name: String = ""
+    code: Int = 0
+    projection: Projection
+    shift: [Float] = []
+    shiftKnown: Bool = true
+    primeMeridian: Float = 0.0
+    toMeter: Float = 1.0
+    angleUnit: Float = 1.0
+    axis: String = "enu"
+    datumName: String = ""
+    // The datum's ellipsoid (the projection may use another: a sphere for
+    // Web Mercator and +R_A).
+    datumEllipsoid: Ellipsoid = wgs84()
+    // The prime meridian the shift to WGS84 counts longitudes from, when
+    // it isn't the system's own (MGI (Ferro): 17°39'46.02"W rather than
+    // 17°40'W). NaN when it is.
+    shiftMeridian: Float = 0.0 / 0.0
+
+    // Whether it's latitude and longitude rather than a projection.
+    fn isGeographic() -> Bool {
+        projection.method == "longlat"
+    }
+
+    // The datum's ellipsoid.
+    fn ellipsoid() -> Ellipsoid {
+        datumEllipsoid
+    }
+
+    // toLonLat(x, y)
+    //   Longitude and latitude on this system's own datum (degrees, from
+    //   Greenwich).
+    fn toLonLat(_ x0: Float, _ y0: Float) -> (Float, Float) {
+        var x = x0
+        var y = y0
+        if axis.hasPrefix("w") {
+            x = -x
+        }
+        if axis.character(at: 1) == "s" {
+            y = -y
+        }
+        if isGeographic() {
+            return (angNormalize(x * angleUnit + primeMeridian), y * angleUnit)
+        }
+        let (lon, lat) = projection.inverse(x * toMeter, y * toMeter)
+        (angNormalize(lon + primeMeridian), lat)
+    }
+
+    // fromLonLat(lon, lat)
+    //   This system's (x, y) of a longitude and latitude on its own datum.
+    fn fromLonLat(_ lon: Float, _ lat: Float) -> (Float, Float) {
+        var x = 0.0
+        var y = 0.0
+        if isGeographic() {
+            let (d, _) = angDiff(primeMeridian, lon)
+            x = d / angleUnit
+            y = lat / angleUnit
+        } else {
+            let (d, _) = angDiff(primeMeridian, lon)
+            let (px, py) = projection.forward(d, lat)
+            x = px / toMeter
+            y = py / toMeter
+        }
+        if axis.hasPrefix("w") {
+            x = -x
+        }
+        if axis.character(at: 1) == "s" {
+            y = -y
+        }
+        (x, y)
+    }
+
+    // toWGS84(x, y)
+    //   WGS84 longitude and latitude of a point in this system.
+    fn toWGS84(_ x: Float, _ y: Float) -> (Float, Float) {
+        let (lon, lat) = toLonLat(x, y)
+        datumToWGS84(self, lon, lat)
+    }
+
+    // fromWGS84(lon, lat)
+    //   This system's (x, y) of a WGS84 longitude and latitude.
+    fn fromWGS84(_ lon: Float, _ lat: Float) -> (Float, Float) {
+        let (l, p) = datumFromWGS84(self, lon, lat)
+        fromLonLat(l, p)
+    }
+
+    // gridFactors(lon, lat)
+    //   The grid's scale and convergence at a point (longitude and latitude
+    //   on this system's datum): (meridianScale, parallelScale,
+    //   convergence). The scales are grid length over true length along the
+    //   meridian and the parallel (the same for conformal projections like
+    //   TM, UTM, Lambert and stereographic: the point scale factor k, for
+    //   reducing ground distances to the grid). The convergence is the
+    //   angle in degrees from true north to grid north, clockwise. As
+    //   PROJ's get_factors, true lengths are on the projection's own
+    //   ellipsoid (for Web Mercator, its sphere).
+    fn gridFactors(_ lon: Float, _ lat: Float) -> (Float, Float, Float) {
+        if isGeographic() {
+            return (0.0 / 0.0, 0.0 / 0.0, 0.0)
+        }
+        // True lengths on the projection's own ellipsoid, as PROJ: the
+        // sphere for Web Mercator.
+        let g = projection.ellipsoid
+        let (s, _) = sincosd(lat)
+        let w = sqrt(1.0 - g.e2 * s * s)
+        let rho = g.a * (1.0 - g.e2) / (w * w * w)
+        let nu = g.a / w
+        let (_, c) = sincosd(lat)
+        // Small steps north and east, in degrees, about a metre long.
+        let h = 1e-5
+        let (xn1, yn1) = fromLonLat(lon, lat - h)
+        let (xn2, yn2) = fromLonLat(lon, lat + h)
+        let (xe1, ye1) = fromLonLat(lon - h, lat)
+        let (xe2, ye2) = fromLonLat(lon + h, lat)
+        let sx = if axis.hasPrefix("w") { -1.0 } else { 1.0 }
+        let sy = if axis.character(at: 1) == "s" { -1.0 } else { 1.0 }
+        let dxn = (xn2 - xn1) * toMeter * sx
+        let dyn = (yn2 - yn1) * toMeter * sy
+        let dxe = (xe2 - xe1) * toMeter * sx
+        let dye = (ye2 - ye1) * toMeter * sy
+        let trueNorth = rho * 2.0 * h * degree
+        let trueEast = nu * c * 2.0 * h * degree
+        let h2 = hypot(dxn, dyn) / trueNorth
+        let k2 = hypot(dxe, dye) / trueEast
+        let conv = atan2(-dxn, dyn) / degree
+        (h2, k2, conv)
+    }
+
+    // proj()
+    //   The system as a PROJ string, with its +towgs84.
+    fn proj() -> String {
+        crsToProj(self)
+    }
+
+    // wkt()
+    //   The system as WKT1 (GDAL's), for a shapefile's .prj.
+    fn wkt() -> String {
+        crsToWkt(self)
+    }
+}
+
+// Whether two systems are on the same datum: then transforming between
+// them needs no shift.
+fn sameDatum(_ a: Crs, _ b: Crs) -> Bool {
+    let ea = a.ellipsoid()
+    let eb = b.ellipsoid()
+    ea.a == eb.a && ea.f == eb.f && a.shift == b.shift && a.shiftKnown == b.shiftKnown &&
+        (a.shiftMeridian.isNaN == b.shiftMeridian.isNaN) && (a.shiftMeridian.isNaN || a.shiftMeridian == b.shiftMeridian)
+}
+
+// Geodetic (degrees, height 0) to geocentric x, y, z.
+fn toGeocentric(_ g: Ellipsoid, _ lon: Float, _ lat: Float) -> (Float, Float, Float) {
+    let (sphi, cphi) = sincosd(lat)
+    let (slam, clam) = sincosd(lon)
+    let n = g.a / sqrt(1.0 - g.e2 * sphi * sphi)
+    (n * cphi * clam, n * cphi * slam, n * (1.0 - g.e2) * sphi)
+}
+
+// Geocentric to geodetic (degrees).
+fn fromGeocentric(_ g: Ellipsoid, _ x: Float, _ y: Float, _ z: Float) -> (Float, Float) {
+    let lon = atan2(y, x) / degree
+    let p = hypot(x, y)
+    var phi = atan2(z, p * (1.0 - g.e2))
+    for _ in 0..10 {
+        let s = sin(phi)
+        let n = g.a / sqrt(1.0 - g.e2 * s * s)
+        let h = if abs(cos(phi)) > 1e-10 { p / cos(phi) - n } else { abs(z) / abs(s) - n * (1.0 - g.e2) }
+        let next = atan2(z, p * (1.0 - g.e2 * n / (n + h)))
+        let d = abs(next - phi)
+        phi = next
+        if d < 1e-15 {
+            break
+        }
+    }
+    (lon, phi / degree)
+}
+
+// A Helmert transformation, as PROJ does it: rotations linearized, the
+// reverse by the transposed rotation.
+fn helmert(_ t: [Float], _ x: Float, _ y: Float, _ z: Float, _ reverse: Bool) -> (Float, Float, Float) {
+    let sec = degree / 3600.0
+    let rx = t[3] * sec
+    let ry = t[4] * sec
+    let rz = t[5] * sec
+    let s = 1.0 + t[6] * 1e-6
+    if !reverse {
+        return (t[0] + s * (x - rz * y + ry * z), t[1] + s * (rz * x + y - rx * z), t[2] + s * (-ry * x + rx * y + z))
+    }
+    let px = (x - t[0]) / s
+    let py = (y - t[1]) / s
+    let pz = (z - t[2]) / s
+    (px + rz * py - ry * pz, -rz * px + py + rx * pz, ry * px - rx * py + pz)
+}
+
+// A longitude as the shift sees it.
+fn shiftLon(_ c: Crs, _ lon: Float) -> Float {
+    if c.shiftMeridian.isNaN { lon } else { lon - c.primeMeridian + c.shiftMeridian }
+}
+
+fn unshiftLon(_ c: Crs, _ lon: Float) -> Float {
+    if c.shiftMeridian.isNaN { lon } else { lon + c.primeMeridian - c.shiftMeridian }
+}
+
+fn datumToWGS84(_ c: Crs, _ lon: Float, _ lat: Float) -> (Float, Float) {
+    if c.shift.isEmpty || !lon.isFinite || !lat.isFinite {
+        return (lon, lat)
+    }
+    let (x, y, z) = toGeocentric(c.ellipsoid(), shiftLon(c, lon), lat)
+    let (wx, wy, wz) = helmert(c.shift, x, y, z, false)
+    fromGeocentric(wgs84(), wx, wy, wz)
+}
+
+fn datumFromWGS84(_ c: Crs, _ lon: Float, _ lat: Float) -> (Float, Float) {
+    if c.shift.isEmpty || !lon.isFinite || !lat.isFinite {
+        return (lon, lat)
+    }
+    let (x, y, z) = toGeocentric(wgs84(), lon, lat)
+    let (dx, dy, dz) = helmert(c.shift, x, y, z, true)
+    let (l, p) = fromGeocentric(c.ellipsoid(), dx, dy, dz)
+    (unshiftLon(c, l), p)
+}
+
+// transform(x, y, from:, to:)
+//   A point from one system to another: (easting, northing) or
+//   (longitude, latitude), as each system has them.
+//
+//   let prs92 = geodesy.epsg(3123) ?? geodesy.wgs84Crs()          // PRS92 / Philippines zone 3
+//   let (e, n) = geodesy.transform(121.0244, 14.5547, from: geodesy.wgs84Crs(), to: prs92)
+public fn transform(_ x: Float, _ y: Float, from: Crs, to: Crs) -> (Float, Float) {
+    let (lon, lat) = from.toLonLat(x, y)
+    if sameDatum(from, to) {
+        return to.fromLonLat(lon, lat)
+    }
+    if !from.shift.isEmpty && !to.shift.isEmpty && lon.isFinite && lat.isFinite {
+        // Both datums shift: stay geocentric between the two Helmerts, as
+        // PROJ does, so the height isn't lost on the way.
+        let (gx, gy, gz) = toGeocentric(from.ellipsoid(), shiftLon(from, lon), lat)
+        let (wx, wy, wz) = helmert(from.shift, gx, gy, gz, false)
+        let (tx, ty, tz) = helmert(to.shift, wx, wy, wz, true)
+        let (l, p) = fromGeocentric(to.ellipsoid(), tx, ty, tz)
+        return to.fromLonLat(unshiftLon(to, l), p)
+    }
+    let (wl, wp) = datumToWGS84(from, lon, lat)
+    let (l, p) = datumFromWGS84(to, wl, wp)
+    to.fromLonLat(l, p)
+}
+
+// transformAll(xs, ys, from:, to:)
+//   Many points from one system to another.
+public fn transformAll(_ xs: [Float], _ ys: [Float], from: Crs, to: Crs) -> ([Float], [Float]) {
+    if xs.count != ys.count {
+        fail("transformAll: {xs.count} x values but {ys.count} y values")
+    }
+    var ox: [Float] = []
+    var oy: [Float] = []
+    for k in 0..xs.count {
+        let (x, y) = transform(xs[k], ys[k], from: from, to: to)
+        ox.append(x)
+        oy.append(y)
+    }
+    (ox, oy)
+}
+
+// wgs84Crs()
+//   Longitude and latitude on WGS84 (EPSG:4326, with x the longitude).
+public fn wgs84Crs() -> Crs {
+    Crs(name: "WGS 84", code: 4326, projection: projection("longlat"), datumName: "WGS 84")
+}
+
+// utmZone(lat, lon)
+//   The UTM zone of a point, 1…60, with Norway's and Svalbard's
+//   exceptions.
+public fn utmZone(_ lat: Float, _ lon: Float) -> Int {
+    let l = angNormalize(lon)
+    var zone = Int(floor((l + 180.0) / 6.0)) + 1
+    if zone > 60 {
+        zone = 60
+    }
+    if lat >= 56.0 && lat < 64.0 && l >= 3.0 && l < 12.0 {
+        zone = 32
+    }
+    if lat >= 72.0 && lat < 84.0 {
+        if l >= 0.0 && l < 9.0 {
+            zone = 31
+        } else if l >= 9.0 && l < 21.0 {
+            zone = 33
+        } else if l >= 21.0 && l < 33.0 {
+            zone = 35
+        } else if l >= 33.0 && l < 42.0 {
+            zone = 37
+        }
+    }
+    zone
+}
+
+// utm(zone:, south:)
+//   WGS84 / UTM zone (EPSG:32601…32660, 32701…32760).
+public fn utm(zone: Int, south: Bool = false) -> Crs {
+    if zone < 1 || zone > 60 {
+        fail("utm: the zone must be from 1 to 60, not {zone}")
+    }
+    let code = (if south { 32700 } else { 32600 }) + zone
+    epsg(code) ?? wgs84Crs()
+}
+
+// utmFor(lat, lon)
+//   The WGS84 UTM system a point falls in.
+public fn utmFor(_ lat: Float, _ lon: Float) -> Crs {
+    utm(zone: utmZone(lat, lon), south: lat < 0.0)
+}
+
+// --- Names: ellipsoids, units and prime meridians.
+
+// ellipsoidNamed(name)
+//   One of PROJ's ellipsoids by its name: "WGS84", "GRS80", "clrk66"
+//   (Clarke 1866, of PRS92 and Luzon 1911), "intl", "bessel", "airy" and
+//   40 more. nil if it isn't one.
+public fn ellipsoidNamed(_ name: String) -> Ellipsoid? {
+    for row in ellipsoidRows {
+        let f = row.split("|")
+        if f[0] == name {
+            let a = Float(f[1]) ?? 0.0
+            let rf = Float(f[2]) ?? 0.0
+            return ellipsoid(a: a, f: if rf == 0.0 { 0.0 } else { 1.0 / rf }, name: name)
+        }
+    }
+    nil
+}
+
+// ellipsoidNames()
+//   The names ellipsoidNamed knows.
+public fn ellipsoidNames() -> [String] {
+    ellipsoidRows.map { r in r.split("|")[0] }
+}
+
+fn unitMetres(_ name: String) -> Float? {
+    for row in unitRows {
+        let f = row.split("|")
+        if f[0] == name {
+            return Float(f[1])
+        }
+    }
+    nil
+}
+
+fn meridianDegrees(_ name: String) -> Float? {
+    if let v = Float(name) {
+        return v
+    }
+    for row in meridianRows {
+        let f = row.split("|")
+        if f[0] == name {
+            return Float(f[1]) ?? readAngle(f[1]).value()
+        }
+    }
+    nil
+}
+
+// --- EPSG.
+
+fn geographicRow(_ code: Int) -> [String]? {
+    let key = "{code}|"
+    for row in geographicRows {
+        if row.hasPrefix(key) {
+            return row.split("|")
+        }
+    }
+    nil
+}
+
+fn geographicCrs(_ f: [String]) -> Crs {
+    let a = Float(f[2]) ?? 6378137.0
+    let rf = Float(f[3]) ?? 0.0
+    let g = ellipsoid(a: a, f: if rf == 0.0 { 0.0 } else { 1.0 / rf })
+    var shift: [Float] = []
+    if !f[7].isEmpty {
+        shift = f[7].split(",").map { v in Float(v) ?? 0.0 }
+    }
+    Crs(name: f[1], code: Int(f[0]) ?? 0, projection: prepared(Projection(method: "longlat", ellipsoid: g)),
+        shift: shift, shiftKnown: f[6] == "1", primeMeridian: Float(f[4]) ?? 0.0, angleUnit: Float(f[5]) ?? 1.0,
+        datumName: f[1], datumEllipsoid: g, shiftMeridian: if f.count > 8 && !f[8].isEmpty { Float(f[8]) ?? (0.0 / 0.0) } else { 0.0 / 0.0 })
+}
+
+// epsg(code)
+//   The system with an EPSG code, or nil when geodesy doesn't have it:
+//   578 geographic systems and 5144 projected ones (UTM, the Philippine
+//   zones of PRS92 and Luzon 1911, state planes, national grids…), with
+//   PROJ's own choice of shift to WGS84 when it's a Helmert.
+//
+//   let zone3 = geodesy.epsg(3123)        // PRS92 / Philippines zone 3
+public fn epsg(_ code: Int) -> Crs? {
+    if let f = geographicRow(code) {
+        return geographicCrs(f)
+    }
+    let key = "{code}|"
+    for row in projectedRows {
+        if row.hasPrefix(key) {
+            let f = row.split("|")
+            if let gf = geographicRow(Int(f[2]) ?? 0) {
+                let base = geographicCrs(gf)
+                match parseProjPart(f[3], base) {
+                    .ok(c) -> {
+                        var out = c
+                        out.name = f[1]
+                        out.code = code
+                        return out
+                    }
+                    .failure(_) -> { return nil }
+                }
+            }
+        }
+    }
+    nil
+}
+
+// epsgCodes(search:)
+//   The EPSG codes geodesy has whose names contain `search` (any case),
+//   with their names: epsgCodes(search: "Philippines") lists the zones.
+public fn epsgCodes(search: String = "") -> [(Int, String)] {
+    var out: [(Int, String)] = []
+    let s = search.lowercase()
+    for rows in [geographicRows, projectedRows] {
+        for row in rows {
+            let f = row.split("|")
+            if s.isEmpty || f[1].lowercase().contains(s) {
+                out.append((Int(f[0]) ?? 0, f[1]))
+            }
+        }
+    }
+    out
+}
+
+// --- PROJ strings.
+
+fn projTokens(_ text: String) -> [String: String] {
+    var out: [String: String] = [:]
+    for tok in text.replace("\t", with: " ").split(" ") {
+        let t = if tok.hasPrefix("+") { tok.substring(from: 1, to: tok.count) } else { tok }
+        if t.isEmpty {
+            continue
+        }
+        if let k = t.find("=") {
+            out[t.substring(from: 0, to: k)] = t.substring(from: k + 1, to: t.count)
+        } else {
+            out[t] = ""
+        }
+    }
+    out
+}
+
+// An angle parameter: degrees, or PROJ's DMS ("40d30'N").
+fn projAngle(_ p: [String: String], _ key: String, _ fallback: Float) -> Result<Float> {
+    if let v = p[key] {
+        if let x = Float(v) {
+            return Result.ok(value: x)
+        }
+        return readAngle(v)
+    }
+    Result.ok(value: fallback)
+}
+
+// The projection part of a PROJ string, on a base system's datum.
+fn parseProjPart(_ text: String, _ base: Crs) -> Result<Crs> {
+    let p = projTokens(text)
+    var method = p["proj"] ?? ""
+    if ["latlong", "lonlat", "latlon", "longlat"].contains(method) {
+        method = "longlat"
+    }
+    var g = base.ellipsoid()
+    var lat0 = try projAngle(p, "lat_0", 0.0)
+    var lon0 = try projAngle(p, "lon_0", 0.0)
+    let lat1 = try projAngle(p, "lat_1", 0.0)
+    let lat2v = try projAngle(p, "lat_2", 0.0 / 0.0)
+    let latTs = try projAngle(p, "lat_ts", 0.0 / 0.0)
+    var k0 = Float(p["k_0"] ?? p["k"] ?? "1") ?? 1.0
+    var x0 = Float(p["x_0"] ?? "0") ?? 0.0
+    var y0 = Float(p["y_0"] ?? "0") ?? 0.0
+    var toMeter = 1.0
+    if let u = p["units"] {
+        if let m = unitMetres(u) {
+            toMeter = m
+        } else {
+            return Result.failure(error: Error("\"{u}\" isn't a unit PROJ knows"))
+        }
+    }
+    if let tm = p["to_meter"] {
+        if let m = Float(tm) {
+            toMeter = m
+        } else if tm.contains("/") {
+            let parts = tm.split("/")
+            toMeter = (Float(parts[0]) ?? 1.0) / (Float(parts[1]) ?? 1.0)
+        }
+    }
+    // PROJ's false easting and northing are in metres, whatever the units.
+    if method == "utm" {
+        let zone = Int(p["zone"] ?? "0") ?? 0
+        if zone < 1 || zone > 60 {
+            return Result.failure(error: Error("+proj=utm needs +zone from 1 to 60"))
+        }
+        method = "tmerc"
+        lon0 = Float(zone * 6 - 183)
+        lat0 = 0.0
+        k0 = 0.9996
+        x0 = 500000.0
+        y0 = if p["south"] != nil { 10000000.0 } else { 0.0 }
+    }
+    if method == "ups" {
+        method = "stere"
+        lat0 = if p["south"] != nil { -90.0 } else { 90.0 }
+        k0 = 0.994
+        x0 = 2000000.0
+        y0 = 2000000.0
+    }
+    if method == "webmerc" {
+        let r = Float(p["R"] ?? "") ?? g.a
+        g = ellipsoid(a: r, f: 0.0)
+    }
+    if p["R_A"] != nil {
+        // The sphere with the ellipsoid's area (PROJ's series).
+        let es = g.e2
+        g = ellipsoid(a: g.a * (1.0 - es * (1.0 / 6.0 + es * (17.0 / 360.0 + es * 67.0 / 3024.0))), f: 0.0)
+    }
+    let known = ["longlat", "tmerc", "merc", "webmerc", "lcc", "aea", "stere", "sterea", "laea", "eqc", "cass"]
+    if !known.contains(method) {
+        return Result.failure(error: Error(if method.isEmpty { "the PROJ string has no +proj=" } else { "geodesy doesn't have the projection \"{method}\"" }))
+    }
+    var lat1u = lat1
+    if method == "lcc" && p["lat_1"] == nil {
+        lat1u = lat0
+    }
+    if (method == "aea") && p["lat_1"] == nil {
+        lat1u = lat0
+    }
+    let proj = prepared(Projection(method: method, ellipsoid: g, lat0: lat0, lon0: lon0, lat1: lat1u,
+                                   lat2: if lat2v.isNaN { 0.0 } else { lat2v }, latTs: if latTs.isNaN { 0.0 } else { latTs },
+                                   k0: k0, x0: x0, y0: y0, hasLat2: !lat2v.isNaN, hasLatTs: !latTs.isNaN))
+    var c = base
+    c.projection = proj
+    if method == "cass" && p["hyperbolic"] != nil {
+        var hp = proj
+        hp.hyperbolic = true
+        c.projection = hp
+    }
+    c.toMeter = toMeter
+    c.axis = p["axis"] ?? "enu"
+    if method == "longlat" {
+        c.toMeter = 1.0
+    }
+    Result.ok(value: c)
+}
+
+// The datum of a PROJ string: ellipsoid, shift, prime meridian.
+fn projDatum(_ p: [String: String]) -> Result<Crs> {
+    var g = wgs84()
+    var shift: [Float] = []
+    var known = true
+    var datumName = "WGS 84"
+    if let d = p["datum"] {
+        let datums: [String: (String, String)] = [
+            "WGS84": ("WGS84", ""), "NAD83": ("GRS80", ""), "GGRS87": ("GRS80", "-199.87,74.79,246.62"),
+            "potsdam": ("bessel", "598.1,73.7,418.2,0.202,0.045,-2.455,6.7"), "carthage": ("clrk80ign", "-263.0,6.0,431.0"),
+            "hermannskogel": ("bessel", "577.326,90.129,463.919,5.137,1.474,5.297,2.4232"),
+            "ire65": ("mod_airy", "482.530,-130.596,564.557,-1.042,-0.214,-0.631,8.15"),
+            "nzgd49": ("intl", "59.47,-5.04,187.44,0.47,-0.1,1.024,-4.5993"),
+            "OSGB36": ("airy", "446.448,-125.157,542.060,0.1502,0.2470,0.8421,-20.4894"), "NAD27": ("clrk66", "?")]
+        if let (e, t) = datums[d] {
+            g = ellipsoidNamed(e) ?? wgs84()
+            datumName = d
+            if t == "?" {
+                known = false
+            } else if !t.isEmpty {
+                shift = t.split(",").map { v in Float(v) ?? 0.0 }
+            }
+        } else {
+            return Result.failure(error: Error("\"{d}\" isn't a datum PROJ strings name"))
+        }
+    }
+    if let e = p["ellps"] {
+        if let named = ellipsoidNamed(e) {
+            g = named
+        } else {
+            return Result.failure(error: Error("\"{e}\" isn't an ellipsoid PROJ knows"))
+        }
+        if p["datum"] == nil {
+            datumName = e
+            known = p["towgs84"] != nil || e == "WGS84"
+        }
+    }
+    if let r = p["R"] {
+        if p["proj"] != "webmerc" {
+            g = ellipsoid(a: Float(r) ?? 6370997.0, f: 0.0)
+        }
+    }
+    if let a = p["a"] {
+        let av = Float(a) ?? 6378137.0
+        if let b = p["b"] {
+            let bv = Float(b) ?? av
+            g = ellipsoid(a: av, f: (av - bv) / av)
+        } else if let rf = p["rf"] {
+            let r = Float(rf) ?? 0.0
+            g = ellipsoid(a: av, f: if r == 0.0 { 0.0 } else { 1.0 / r })
+        } else if let f = p["f"] {
+            g = ellipsoid(a: av, f: Float(f) ?? 0.0)
+        } else {
+            g = ellipsoid(a: av, f: 0.0)
+        }
+        if p["datum"] == nil && p["ellps"] == nil {
+            known = p["towgs84"] != nil
+            datumName = "unnamed"
+        }
+    }
+    if let t = p["towgs84"] {
+        let v = t.split(",").map { s in Float(s.trim()) ?? 0.0 }
+        if v.count != 3 && v.count != 7 {
+            return Result.failure(error: Error("+towgs84 needs 3 or 7 numbers, not {v.count}"))
+        }
+        shift = if v.count == 3 { [v[0], v[1], v[2], 0.0, 0.0, 0.0, 0.0] } else { v }
+        if shift.all({ s in s == 0.0 }) && g.a == 6378137.0 {
+            shift = []
+        }
+        known = true
+    }
+    if let n = p["nadgrids"] {
+        if n == "@null" {
+            shift = []
+            known = true
+        } else {
+            known = false
+        }
+    }
+    var pm = 0.0
+    if let m = p["pm"] {
+        if let v = meridianDegrees(m) {
+            pm = v
+        } else {
+            return Result.failure(error: Error("\"{m}\" isn't a prime meridian PROJ knows"))
+        }
+    }
+    Result.ok(value: Crs(name: "", projection: prepared(Projection(method: "longlat", ellipsoid: g)), shift: shift,
+                         shiftKnown: known, primeMeridian: pm, datumName: datumName, datumEllipsoid: g))
+}
+
+// fromProj(text)
+//   A system from a PROJ string: "+proj=tmerc +lat_0=0 +lon_0=121
+//   +k=0.99995 +x_0=500000 +y_0=0 +ellps=clrk66 +towgs84=-127.62,-67.24,
+//   -47.04,-3.068,4.903,1.578,-1.06 +units=m". Also "+init=epsg:3123".
+public fn fromProj(_ text: String) -> Result<Crs> {
+    let p = projTokens(text)
+    if let i = p["init"] {
+        let low = i.lowercase()
+        if low.hasPrefix("epsg:") {
+            if let c = epsg(Int(low.substring(from: 5, to: low.count)) ?? 0) {
+                return Result.ok(value: c)
+            }
+        }
+        return Result.failure(error: Error("geodesy doesn't have \"{i}\""))
+    }
+    if p["proj"] == nil {
+        return Result.failure(error: Error("the PROJ string has no +proj="))
+    }
+    let base = try projDatum(p)
+    var c = try parseProjPart(text, base)
+    c.name = text.trim()
+    Result.ok(value: c)
+}
+
+fn crsToProj(_ c: Crs) -> String {
+    var parts: [String] = []
+    let p = c.projection
+    let method = p.method
+    parts.append("+proj={method}")
+    if method != "longlat" {
+        parts.append("+lat_0={p.lat0}")
+        parts.append("+lon_0={p.lon0}")
+        if method == "lcc" || method == "aea" {
+            parts.append("+lat_1={p.lat1}")
+            if p.hasLat2 {
+                parts.append("+lat_2={p.lat2}")
+            }
+        }
+        if p.hasLatTs {
+            parts.append("+lat_ts={p.latTs}")
+        }
+        if p.hyperbolic {
+            parts.append("+hyperbolic")
+        }
+        if p.k0 != 1.0 {
+            parts.append("+k={p.k0}")
+        }
+        parts.append("+x_0={p.x0}")
+        parts.append("+y_0={p.y0}")
+    }
+    let g = c.ellipsoid()
+    if method == "webmerc" {
+        parts.append("+R={g.a}")
+    } else {
+        parts.append("+a={g.a}")
+        parts.append("+rf={g.inverseFlattening()}")
+    }
+    if !c.shift.isEmpty {
+        parts.append("+towgs84={c.shift.map { v in "{v}" }.joined(separator: ",")}")
+    }
+    if c.primeMeridian != 0.0 {
+        parts.append("+pm={c.primeMeridian}")
+    }
+    if method != "longlat" && c.toMeter != 1.0 {
+        parts.append("+to_meter={c.toMeter}")
+    }
+    if c.axis != "enu" {
+        parts.append("+axis={c.axis}")
+    }
+    parts.append("+no_defs")
+    parts.joined(separator: " ")
+}
+
+// crs(text)
+//   A system from any text: "EPSG:3123", "epsg:4326", a PROJ string, or
+//   WKT (a .prj file's contents).
+//
+//   let c = try geodesy.crs("EPSG:32651")
+public fn crs(_ text: String) -> Result<Crs> {
+    let t = text.trim()
+    let low = t.lowercase()
+    if low.hasPrefix("epsg:") {
+        let code = Int(t.substring(from: 5, to: t.count).trim()) ?? -1
+        if let c = epsg(code) {
+            return Result.ok(value: c)
+        }
+        return Result.failure(error: Error("geodesy doesn't have EPSG:{code}"))
+    }
+    if t.hasPrefix("+") || low.hasPrefix("proj=") {
+        return fromProj(t)
+    }
+    fromWkt(t)
+}

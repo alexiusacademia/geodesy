@@ -1,0 +1,236 @@
+// geodesy: angles and positions as text. Reads degrees in the ways people
+// and instruments write them (14°35'45.2"N, 14 35 45.2 N, N14°35.753',
+// 121:30:00E, -121.5, 40d30'N) and writes them in degrees, degrees and
+// minutes, or degrees, minutes and seconds.
+//
+// Author: Alexius Academia
+// Date: 2026-10-31
+
+// How an angle is written.
+public enum AngleStyle {
+    // 14.595833°
+    decimal
+    // 14°35.7500'
+    degreesMinutes
+    // 14°35'45.00"
+    degreesMinutesSeconds
+}
+
+fn isDigitChar(_ ch: String) -> Bool {
+    ch >= "0" && ch <= "9"
+}
+
+// readAngle(text)
+//   An angle in degrees from text: "14.5995", "-121.5", "14°35'45.2\"N",
+//   "14 35 45.2 S", "N14°35.753'", "121:30:00E", "121d30m15s W", "40d30'N".
+//   N and E are positive, S and W negative. A failure says what's wrong.
+public fn readAngle(_ text: String) -> Result<Float> {
+    var t = text.trim()
+    if t.isEmpty {
+        return Result.failure(error: Error("type an angle"))
+    }
+    var sign = 1.0
+    var hemis = ""
+    // A hemisphere letter at either end.
+    let first = (t.character(at: 0) ?? "").uppercase()
+    let last = (t.character(at: t.count - 1) ?? "").uppercase()
+    if ["N", "S", "E", "W"].contains(first) {
+        hemis = first
+        t = t.substring(from: 1, to: t.count).trim()
+    } else if ["N", "S", "E", "W"].contains(last) {
+        hemis = last
+        t = t.substring(from: 0, to: t.count - 1).trim()
+    }
+    if hemis == "S" || hemis == "W" {
+        sign = -1.0
+    }
+    if t.hasPrefix("-") || t.hasPrefix("−") {
+        sign = -sign
+        t = t.substring(from: 1, to: t.count).trim()
+    } else if t.hasPrefix("+") {
+        t = t.substring(from: 1, to: t.count).trim()
+    }
+    // The numbers, with what follows each: ° d : ' ′ m " ″ s or a space.
+    var numbers: [Float] = []
+    var marks: [String] = []
+    var current = ""
+    for ch in t.characters {
+        if isDigitChar(ch) || ch == "." || ch == "," {
+            current += if ch == "," { "." } else { ch }
+        } else {
+            if !current.isEmpty {
+                if let v = Float(current) {
+                    numbers.append(v)
+                    marks.append("")
+                } else {
+                    return Result.failure(error: Error("\"{current}\" isn't a number"))
+                }
+                current = ""
+            }
+            let mark = match ch {
+                "°", "d", "D", "º" -> "d"
+                "'", "′", "m", "M", "’" -> "m"
+                "\"", "″", "s", "S", "”" -> "s"
+                ":" -> ":"
+                " " -> " "
+                _ -> "?"
+            }
+            if mark == "?" {
+                return Result.failure(error: Error("\"{ch}\" can't be in an angle"))
+            }
+            if mark != " " && mark != ":" {
+                if marks.isEmpty || !marks[marks.count - 1].isEmpty {
+                    return Result.failure(error: Error("\"{ch}\" needs a number before it"))
+                }
+                marks[marks.count - 1] = mark
+            }
+        }
+    }
+    if !current.isEmpty {
+        if let v = Float(current) {
+            numbers.append(v)
+            marks.append("")
+        } else {
+            return Result.failure(error: Error("\"{current}\" isn't a number"))
+        }
+    }
+    if numbers.isEmpty || numbers.count > 3 {
+        return Result.failure(error: Error("\"{text.trim()}\" isn't an angle"))
+    }
+    // Unmarked numbers are degrees, minutes, seconds in turn.
+    var deg = 0.0
+    var min = 0.0
+    var sec = 0.0
+    var next = "d"
+    for (k, v) in numbers.enumerated() {
+        var m = marks[k]
+        if m.isEmpty {
+            m = next
+        }
+        if m == "d" {
+            deg = v
+            next = "m"
+        } else if m == "m" {
+            min = v
+            next = "s"
+        } else {
+            sec = v
+            next = "?"
+        }
+        if m == "?" {
+            return Result.failure(error: Error("\"{text.trim()}\" has too many numbers"))
+        }
+    }
+    if min >= 60.0 || sec >= 60.0 {
+        return Result.failure(error: Error("minutes and seconds must be below 60 in \"{text.trim()}\""))
+    }
+    Result.ok(value: sign * (deg + min / 60.0 + sec / 3600.0))
+}
+
+// readLatLon(text)
+//   A position from text, as (latitude, longitude): "14.5995, 120.9842",
+//   "14°35'58.2\"N 120°59'03.1\"E", "N14 35 58.2 E120 59 03.1",
+//   "120.9842E 14.5995N" (hemisphere letters say which is which).
+public fn readLatLon(_ text: String) -> Result<(Float, Float)> {
+    let t = text.trim()
+    var parts: [String] = []
+    if let k = t.find(",") {
+        parts = [t.substring(from: 0, to: k), t.substring(from: k + 1, to: t.count)]
+    } else {
+        // Hemisphere letters: before the numbers ("N14 35 E120 59"), split
+        // before the second letter; after them ("14 35 N 120 59 E"), split
+        // after the first.
+        let chars = t.characters
+        var letters: [Int] = []
+        for (k, ch) in chars.enumerated() {
+            let up = ch.uppercase()
+            if up == "N" || up == "S" || up == "E" || up == "W" {
+                letters.append(k)
+            }
+        }
+        if letters.count == 2 {
+            let cut = if letters[0] == 0 { letters[1] } else { letters[0] + 1 }
+            parts = [t.substring(from: 0, to: cut), t.substring(from: cut, to: t.count)]
+        } else {
+            let words = t.words()
+            if words.count % 2 == 0 && words.count > 0 {
+                let half = words.count / 2
+                parts = [words.prefix(half).joined(separator: " "), words.dropFirst(half).joined(separator: " ")]
+            }
+        }
+    }
+    if parts.count != 2 {
+        return Result.failure(error: Error("\"{t}\" isn't a latitude and a longitude"))
+    }
+    let a = parts[0].trim()
+    let b = parts[1].trim()
+    let va = try readAngle(a)
+    let vb = try readAngle(b)
+    let au = a.uppercase()
+    let bu = b.uppercase()
+    let aIsLon = au.hasPrefix("E") || au.hasPrefix("W") || au.hasSuffix("E") || au.hasSuffix("W")
+    let bIsLat = bu.hasPrefix("N") || bu.hasPrefix("S") || bu.hasSuffix("N") || bu.hasSuffix("S")
+    let (lat, lon) = if aIsLon || bIsLat { (vb, va) } else { (va, vb) }
+    if abs(lat) > 90.0 {
+        return Result.failure(error: Error("a latitude must be from -90 to 90, not {lat}"))
+    }
+    Result.ok(value: (lat, lon))
+}
+
+fn pad2(_ x: Int) -> String {
+    if x < 10 { "0{x}" } else { "{x}" }
+}
+
+// The fraction part of a number written with `decimals` digits, padded to
+// two digits before the point: 5.25 → "05.25".
+fn padNumber(_ x: Float, _ decimals: Int) -> String {
+    let s = x.formatted(decimals: max(0, decimals))
+    if x < 10.0 { "0" + s } else { s }
+}
+
+// formatAngle(degrees, style:, decimals:, hemispheres:)
+//   An angle as text: decimal degrees ("14.595833°"), degrees and minutes
+//   ("14°35.7500'") or degrees, minutes and seconds ("14°35'45.00\"").
+//   `hemispheres` is "NS" or "EW" to write a letter instead of a sign.
+//   Rounding carries properly: 59.999" becomes the next minute.
+public fn formatAngle(_ degrees: Float, style: AngleStyle = .degreesMinutesSeconds, decimals: Int = 2,
+                      hemispheres: String = "") -> String {
+    if !degrees.isFinite {
+        return "{degrees}"
+    }
+    let negative = degrees < 0.0
+    let a = abs(degrees)
+    let scale = pow(10.0, Float(max(0, decimals)))
+    var text = ""
+    match style {
+        .decimal -> {
+            text = a.formatted(decimals: max(0, decimals)) + "°"
+        }
+        .degreesMinutes -> {
+            let total = round(a * 60.0 * scale) / scale
+            let d = Int(floor(total / 60.0 + 1e-12))
+            let m = total - Float(d) * 60.0
+            text = "{d}°{padNumber(max(0.0, m), decimals)}'"
+        }
+        .degreesMinutesSeconds -> {
+            let total = round(a * 3600.0 * scale) / scale
+            let d = Int(floor(total / 3600.0 + 1e-12))
+            let rest = total - Float(d) * 3600.0
+            let m = Int(floor(rest / 60.0 + 1e-12))
+            let s = rest - Float(m) * 60.0
+            text = "{d}°{pad2(m)}'{padNumber(max(0.0, s), decimals)}\""
+        }
+    }
+    if hemispheres.count == 2 {
+        let letter = if negative { hemispheres.character(at: 1) ?? "" } else { hemispheres.character(at: 0) ?? "" }
+        return text + letter
+    }
+    if negative && a * scale >= 0.5 { "-" + text } else { text }
+}
+
+// formatLatLon(lat, lon, style:, decimals:)
+//   A position as text with hemisphere letters: "14°35'58.20\"N
+//   120°59'03.12\"E".
+public fn formatLatLon(_ lat: Float, _ lon: Float, style: AngleStyle = .degreesMinutesSeconds, decimals: Int = 2) -> String {
+    "{formatAngle(lat, style: style, decimals: decimals, hemispheres: "NS")} {formatAngle(angNormalize(lon), style: style, decimals: decimals, hemispheres: "EW")}"
+}

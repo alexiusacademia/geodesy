@@ -1,0 +1,13 @@
+# The exact versions of the libraries this project uses, worked out by
+# Tessel from tessel.toml. Commit it, so every build uses the same ones.
+
+format = 1
+
+[[package]]
+name = "chart"
+version = "0.1.1"
+source = "index"
+repository = "https://github.com/alexiusacademia/chart"
+tag = "v0.1.1"
+commit = "67a3a5edd9bf8de99ec798e76c54433fa2956f64"
+checksum = "sha256:37d03e33a5cc3f574a00351d1afc2767b922994e2a86ac718a14564e604c864d"

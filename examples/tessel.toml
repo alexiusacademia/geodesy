@@ -1,0 +1,9 @@
+# geodesy's examples: they draw the README's pictures with the chart
+# library. They're a program of their own, so the library itself needs no
+# other library: chart is listed here, and the library's files come in with
+# `import ".."`. `tessel run examples` from the library's folder saves the
+# pictures in docs/.
+tessel = "0.10.0"
+
+[dependencies]
+chart = "0.1"

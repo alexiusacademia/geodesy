@@ -1,0 +1,142 @@
+// geodesy: rhumb lines (loxodromes): paths that cross every meridian at
+// the same azimuth, as a ship holding one compass course sails. A rhumb is
+// a straight line on a Mercator chart. It's longer than the geodesic
+// between the same points, a little near the equator and much more near
+// the poles.
+//
+// The lengths come from the meridian arc M(φ) and the isometric latitude
+// ψ(φ), worked out by Gauss–Legendre quadrature to full precision, so that
+// nearly east–west lines are as accurate as the others.
+//
+// Author: Alexius Academia
+// Date: 2026-10-31
+
+// 20-point Gauss–Legendre nodes and weights on [-1, 1] (half of them;
+// the rest are their mirror images).
+let glNodes: [Float] = [0.0765265211334973337546404, 0.2277858511416450780804962, 0.3737060887154195606725482,
+                        0.5108670019508270980043641, 0.6360536807265150254528367, 0.7463319064601507926143051,
+                        0.8391169718222188233945291, 0.9122344282513259058677524, 0.9639719272779137912676661,
+                        0.9931285991850949247861224]
+let glWeights: [Float] = [0.1527533871307258506980843, 0.1491729864726037467878287, 0.1420961093183820513292983,
+                          0.1316886384491766268984945, 0.1181945319615184173123774, 0.1019301198172404350367501,
+                          0.0832767415767047487247581, 0.0626720483341090635695065, 0.0406014298003869413310400,
+                          0.0176140071391521183118620]
+
+// ∫ from φ1 to φ2 of f, by Gauss–Legendre on pieces no wider than 10°.
+fn integrate(_ phi1: Float, _ phi2: Float, _ f: fn(Float) -> Float) -> Float {
+    let span = phi2 - phi1
+    if span == 0.0 {
+        return 0.0
+    }
+    let pieces = max(1, Int(ceil(abs(span) / (10.0 * degree))))
+    let h = span / Float(pieces)
+    var total = 0.0
+    for p in 0..pieces {
+        let mid = phi1 + (Float(p) + 0.5) * h
+        let half = h / 2.0
+        var s = 0.0
+        for k in 0..10 {
+            s += glWeights[k] * (f(mid + half * glNodes[k]) + f(mid - half * glNodes[k]))
+        }
+        total += s * half
+    }
+    total
+}
+
+// The meridian arc from the equator to latitude φ (radians), in metres.
+fn meridianArc(_ g: Ellipsoid, _ phi: Float) -> Float {
+    integrate(0.0, phi) { t in g.a * (1.0 - g.e2) / pow(1.0 - g.e2 * sin(t) * sin(t), 1.5) }
+}
+
+// The latitude (radians) at meridian arc m, by Newton's method.
+fn latitudeAtArc(_ g: Ellipsoid, _ m: Float) -> Float {
+    var phi = m / (g.a * (1.0 - g.e2 / 4.0))
+    for _ in 0..30 {
+        let s = sin(phi)
+        let rho = g.a * (1.0 - g.e2) / pow(1.0 - g.e2 * s * s, 1.5)
+        let d = (meridianArc(g, phi) - m) / rho
+        phi -= d
+        if abs(d) < 1e-15 {
+            break
+        }
+    }
+    phi
+}
+
+// The isometric latitude ψ at latitude φ (radians).
+fn isometric(_ g: Ellipsoid, _ phi: Float) -> Float {
+    let s = sin(phi)
+    asinh(tan(phi)) - g.e() * atanh(g.e() * s)
+}
+
+// ΔM / Δψ between two latitudes: the length of a degree of longitude on
+// the rhumb, per radian, worked out as the ratio of two integrals so that
+// it stays exact when the latitudes are close.
+fn rhumbScale(_ g: Ellipsoid, _ phi1: Float, _ phi2: Float) -> Float {
+    if abs(phi2 - phi1) < 1e-12 {
+        let m = (phi1 + phi2) / 2.0
+        return g.a / sqrt(1.0 - g.e2 * sin(m) * sin(m)) * cos(m)
+    }
+    let dm = integrate(phi1, phi2) { t in g.a * (1.0 - g.e2) / pow(1.0 - g.e2 * sin(t) * sin(t), 1.5) }
+    let dpsi = integrate(phi1, phi2) { t in (1.0 - g.e2) / ((1.0 - g.e2 * sin(t) * sin(t)) * cos(t)) }
+    dm / dpsi
+}
+
+// rhumb(lat1, lon1, lat2, lon2, on:)
+//   The rhumb line between two points: its length in metres and its
+//   constant azimuth in degrees clockwise from north: (distance, azimuth).
+//   It goes the short way round in longitude.
+public fn rhumb(_ lat1: Float, _ lon1: Float, _ lat2: Float, _ lon2: Float, on: Ellipsoid = wgs84()) -> (Float, Float) {
+    checkLatLon("rhumb", lat1, lon1)
+    checkLatLon("rhumb", lat2, lon2)
+    let g = on
+    let (dlon, _) = angDiff(lon1, lon2)
+    let phi1 = lat1 * degree
+    let phi2 = lat2 * degree
+    if abs(lat1) == 90.0 || abs(lat2) == 90.0 {
+        let dm = meridianArc(g, phi2) - meridianArc(g, phi1)
+        return (abs(dm), if dm >= 0.0 { 0.0 } else { 180.0 })
+    }
+    let dpsi = isometric(g, phi2) - isometric(g, phi1)
+    let dlam = dlon * degree
+    let azimuth = atan2(dlam, dpsi) / degree
+    let d = rhumbScale(g, phi1, phi2)
+    (abs(d) * hypot(dpsi, dlam), azimuth)
+}
+
+// rhumbDirect(lat, lon, azimuth:, distance:, on:)
+//   The point `distance` metres along the rhumb line from (lat, lon) at a
+//   constant azimuth: (latitude, longitude). NaN if it would pass a pole.
+public fn rhumbDirect(_ lat: Float, _ lon: Float, azimuth: Float, distance: Float, on: Ellipsoid = wgs84()) -> (Float, Float) {
+    checkLatLon("rhumbDirect", lat, lon)
+    let g = on
+    let (salp, calp) = sincosd(azimuth)
+    let phi1 = lat * degree
+    let m2 = meridianArc(g, phi1) + distance * calp
+    let quarter = meridianArc(g, pi / 2.0)
+    if abs(m2) > quarter * (1.0 + 1e-15) {
+        return (0.0 / 0.0, 0.0 / 0.0)
+    }
+    let phi2 = if abs(m2) >= quarter { copysign(pi / 2.0, m2) } else { latitudeAtArc(g, m2) }
+    var dlam = 0.0
+    if abs(phi2) < pi / 2.0 && abs(phi1) < pi / 2.0 {
+        let d = rhumbScale(g, phi1, phi2)
+        dlam = distance * salp / d
+    }
+    (phi2 / degree, angNormalize(lon + dlam / degree))
+}
+
+// rhumbPoints(lat1, lon1, lat2, lon2, count:, on:)
+//   `count` points evenly spaced along the rhumb line, ends included.
+public fn rhumbPoints(_ lat1: Float, _ lon1: Float, _ lat2: Float, _ lon2: Float, count: Int, on: Ellipsoid = wgs84()) -> ([Float], [Float]) {
+    let (s, azi) = rhumb(lat1, lon1, lat2, lon2, on: on)
+    var lats: [Float] = []
+    var lons: [Float] = []
+    let n = max(2, count)
+    for k in 0..n {
+        let (la, lo) = rhumbDirect(lat1, lon1, azimuth: azi, distance: s * Float(k) / Float(n - 1), on: on)
+        lats.append(la)
+        lons.append(lo)
+    }
+    (lats, lons)
+}
